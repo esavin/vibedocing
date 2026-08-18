@@ -13,8 +13,9 @@
 # Disposable git worktrees created by the walker.
 /.vibe-trees/
 
-# An opencode install target if someone runs --setup with the repo as the workspace.
-/.opencode/
+# Python bytecode caches from the vibe_agent package.
+__pycache__/
+*.pyc
 
 # OS / editor noise
 .DS_Store

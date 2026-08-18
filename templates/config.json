@@ -7,7 +7,6 @@
   "language": "@@LANGUAGE@@",
 
   "docs_root": "agent/project",
-  "commit_command": "vibe-commit",
 
   "use_worktree": true,
   "skip_merges": true,
@@ -15,12 +14,31 @@
   "commit_skip_regex": "^(fix|chore|style|test|docs|refactor|perf|build|ci|revert|bump|format|lint|typo)(\\(|:)",
 
   "scope": "",
-  "model": "",
-  "agent": "",
-  "auto": true,
+
+  "validation": {
+    "$comment": "post-write docs validation. mode: strict = remaining errors flip the verdict to ERROR (commit retried); warn = report only; off. rounds: how many repair rounds the agent gets before the final verdict. path_check: severity of the 'cited repo path must exist in the worktree' check.",
+    "mode": "strict",
+    "rounds": 2,
+    "path_check": "error"
+  },
+
   "run_timeout_seconds": 0,
 
   "auto_commit": true,
   "git_author_name": "vibedocing",
-  "git_author_email": "vibedocing@local"
+  "git_author_email": "vibedocing@local",
+
+  "llm": {
+    "base_url": "https://api.openai.com/v1",
+    "api_key_env": "VIBE_API_KEY",
+    "model": "",
+    "temperature": null,
+    "max_tokens": 0,
+    "max_steps": 24,
+    "max_steps_initial": 48,
+    "request_timeout_seconds": 180,
+    "retries": 5,
+    "extra_body": {},
+    "log_transcript": true
+  }
 }

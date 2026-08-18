@@ -30,12 +30,13 @@ _(none yet)_
 ## Sync Status
 
 > The single source of truth for incremental re-runs. The pipeline advances `baseline` to
-> the last fully-processed project commit. After you sync new upstream changes into
+> the last fully-processed project commit and **fills the fields below automatically**
+> after every run — do not edit them by hand. After you sync new upstream changes into
 > `@@SOURCE_ROOT@@`, re-running the pipeline documents only `baseline..HEAD`.
 
 - **Project source:** `@@SOURCE_ROOT@@`
 - **Branch:** `@@BRANCH@@`
-- **Baseline commit:** _(none yet — first run documents from the beginning)_
-- **Last synced:** _(never)_
+- **Baseline commit:** _(filled automatically by the pipeline)_
+- **Last synced:** _(filled automatically by the pipeline)_
 
 *Last updated: @@DATE@@*

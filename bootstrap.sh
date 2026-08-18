@@ -10,7 +10,7 @@
 #   2. Creates agent/project/ (functions/, design/) seeded from templates.
 #   3. Initializes a git repo in the CURRENT folder (if absent) and makes an initial commit.
 #   4. Writes vibedocing/config.json tuned to your project.
-#   5. Installs the opencode command + skill into .opencode/.
+#   5. Verifies python3 (>=3.8) for the built-in agent and prints LLM setup hints.
 #
 # After bootstrap, run:  ./vibedocing/run.sh --list   then   ./vibedocing/run.sh
 #
@@ -25,7 +25,9 @@ TPL="$PIPELINE_DIR/templates"
 TODAY="$(date +%Y-%m-%d)"
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "missing dependency: $1" >&2; exit 1; }; }
-need git; need jq
+need git; need jq; need python3
+python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)' \
+  || { echo "python3 >= 3.8 required" >&2; exit 1; }
 
 # ---- resolve project ----
 PROJECT_DIR="$(cd "$PROJECT_ARG" 2>/dev/null && pwd)" || { echo "project path not found: $PROJECT_ARG" >&2; exit 1; }
@@ -86,7 +88,6 @@ echo ">> branch:      $BRANCH   language: $LANGUAGE ($LAYOUT)"
   echo
   echo "# The documentation solution tooling (local; not part of the documented output)."
   echo "/vibedocing/"
-  echo "/.opencode/"
   echo
   echo "# Disposable git worktrees created by the walker (stateful replay)."
   echo "/.vibe-trees/"
@@ -126,11 +127,20 @@ fi
 render "$TPL/config.json" "$PIPELINE_DIR/config.json"
 echo ">> wrote vibedocing/config.json"
 
-# ---- 5. install opencode command + skill ----
-mkdir -p "$WORK_DIR/.opencode/command" "$WORK_DIR/.opencode/skills"
-[ -d "$PIPELINE_DIR/opencode/command" ] && cp -f "$PIPELINE_DIR"/opencode/command/* "$WORK_DIR/.opencode/command/" 2>/dev/null || true
-[ -d "$PIPELINE_DIR/opencode/skills" ] && cp -rf "$PIPELINE_DIR"/opencode/skills/* "$WORK_DIR/.opencode/skills/" 2>/dev/null || true
-echo ">> installed opencode command + skill into .opencode/"
+# ---- 5. agent runtime sanity + LLM setup hints ----
+echo ">> agent runtime: $(python3 --version 2>&1) (stdlib only; no pip packages needed)"
+
+cat <<EOF
+
+LLM setup (before the first run):
+  1. Set "llm.model" in vibedocing/config.json - any model behind an
+     OpenAI-compatible API.
+  2. Set "llm.base_url" there too if you are not using OpenAI directly
+     (OpenRouter, DeepSeek, Groq, vLLM, Ollama, LiteLLM, ...).
+  3. Export your API key:  export VIBE_API_KEY=...
+     (name configurable via "llm.api_key_env"; local gateways need no key)
+
+EOF
 
 cat <<EOF
 

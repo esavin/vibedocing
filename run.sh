@@ -3,9 +3,10 @@
 # vibedocing/run.sh — incremental, commit-by-commit documentation pipeline (portable).
 #
 # STATEFUL REPLAY: for each project commit (oldest -> newest), check it out into a
-# disposable git worktree and invoke `opencode run --command vibe-commit` headlessly. The
-# agent gets a FRESH, SMALL context per commit, classifies it (DOCUMENT vs SKIP), and
-# updates the docs map under agent/project/.
+# disposable git worktree and invoke the built-in `vibe-agent` CLI headlessly
+# (python3 -m vibe_agent — stdlib-only, speaks any OpenAI-compatible API). The
+# agent gets a FRESH, SMALL context per commit, classifies it (DOCUMENT vs SKIP),
+# and updates the docs map under agent/project/.
 #
 # The outer loop lives HERE (in bash), outside every agent call — by design.
 #
@@ -17,7 +18,9 @@
 # repo (the project folder and this tooling folder are gitignored). One commit per
 # documented project commit, plus a trailing baseline commit if needed.
 #
-# Requires: git, jq, opencode. (optional: timeout)
+# Requires: git, jq, python3 (>=3.8), an OpenAI-compatible LLM endpoint configured in
+# config.json (llm section) or via env (VIBE_MODEL, VIBE_BASE_URL, VIBE_API_KEY).
+# (optional: timeout)
 #
 set -euo pipefail
 
@@ -26,6 +29,7 @@ PIPELINE_DIR="$SCRIPT_DIR"
 WORK_DIR="$(cd "$PIPELINE_DIR/.." && pwd)"
 CONFIG="$PIPELINE_DIR/config.json"
 DOCS_ROOT="$WORK_DIR/agent/project"
+DOCS_ROOT_REL="agent/project"
 SYNC="$DOCS_ROOT/.vibedocing.json"          # COMMITTED — source of truth for baseline
 PROGRESS="$PIPELINE_DIR/progress.json"    # gitignored — processed[]/counters (fast resume)
 WALK_LOG="$PIPELINE_DIR/walk.log"
@@ -33,12 +37,15 @@ VERDICTS="$PIPELINE_DIR/verdicts"
 RUN_LOGS="$PIPELINE_DIR/logs"
 TREES="$WORK_DIR/.vibe-trees"
 
+# make `python3 -m vibe_agent` importable regardless of the caller's cwd
+export PYTHONPATH="$PIPELINE_DIR${PYTHONPATH:+:$PYTHONPATH}"
+
 declare -A SUBJ SHORT PROC
-CUR_TREE=""; SERVE_PID=""; SERVE_LOG=""
+CUR_TREE=""
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
-need git; need jq; need opencode
+need git; need jq; need python3
 
 jstr() { local v; v="$(jq -r "$1" "$CONFIG")"; [ "$v" = "null" ] && v=""; printf '%s' "$v"; }
 jbool() { jq -e "$1 // false" "$CONFIG" >/dev/null 2>&1 && echo true || echo false; }
@@ -53,12 +60,12 @@ SOURCE_REL="$(jstr '.source_root')"; SOURCE_REL="${SOURCE_REL:-.}"
 if [[ "$SOURCE_REL" == /* ]]; then SOURCE_DIR="$SOURCE_REL"; else SOURCE_DIR="$WORK_DIR/$SOURCE_REL"; fi
 BRANCH="$(jstr '.source_branch')";   BRANCH="${BRANCH:-main}"
 SKIP_REGEX="$(jstr '.commit_skip_regex')"
-CMD_NAME="$(jstr '.commit_command')"; CMD_NAME="${CMD_NAME:-vibe-commit}"
+SCOPE="$(jstr '.scope')"
+CFG_MODEL="$(jstr '.llm.model')"
+DOCS_ROOT_REL="$(jstr '.docs_root')"; DOCS_ROOT_REL="${DOCS_ROOT_REL:-agent/project}"
+DOCS_ROOT="$WORK_DIR/$DOCS_ROOT_REL"
 USE_WORKTREE="$(jbool '.use_worktree')"
 SKIP_MERGES="$(jbool '.skip_merges')"
-CFG_MODEL="$(jstr '.model')"
-CFG_AGENT="$(jstr '.agent')"
-AUTO="$(jbool '.auto')"
 RUN_TIMEOUT="$(jstr '.run_timeout_seconds')"; RUN_TIMEOUT="${RUN_TIMEOUT:-0}"
 AUTO_COMMIT="$(jbool '.auto_commit')"
 GIT_NAME="$(jstr '.git_author_name')";   GIT_NAME="${GIT_NAME:-vibedocing}"
@@ -75,23 +82,22 @@ ensure_git_repo() {
 }
 ensure_git_repo
 
-# ---- install command + skill into .opencode/ from canonical copies ----
-install_into_opencode() {
-  local src="$PIPELINE_DIR/opencode"
-  mkdir -p "$WORK_DIR/.opencode/command" "$WORK_DIR/.opencode/skills"
-  [ -d "$src/command" ] && cp -f "$src"/command/* "$WORK_DIR/.opencode/command/" 2>/dev/null || true
-  [ -d "$src/skills" ] && cp -rf "$src"/skills/* "$WORK_DIR/.opencode/skills/" 2>/dev/null || true
-}
-
 # ---- committed sync state (.vibedocing.json) ----
 init_sync() {
   [ -f "$SYNC" ] || cat > "$SYNC" <<JSON
 {"project":"$PROJECT","source_root":"$SOURCE_REL","branch":"$BRANCH","baseline":"","documented_commits":0,"last_synced":null}
 JSON
 }
-sync_set_baseline() { # <sha>
+sync_set_baseline() { # <sha> ("" = no baseline / rolled back before the root)
   jq --arg b "$1" --arg t "$(date -Iseconds)" \
     '.baseline=$b | .last_synced=$t' "$SYNC" > "$SYNC.tmp" && mv "$SYNC.tmp" "$SYNC"
+  # keep PROJECT.md's Sync Status truthful (deterministic, not LLM-maintained).
+  # NB: "${SUBJ[$1]:-}" with an EMPTY $1 is a fatal expansion error ("bad array
+  # subscript") under set -u — || true cannot catch it — hence the explicit guard.
+  local label=""
+  if [ -n "$1" ]; then label="${SUBJ[$1]:-}"; fi
+  python3 -m vibe_agent.hub --docs-root "$DOCS_ROOT" --baseline "$1" \
+    --label "$label" --date "$(date +%F)" >/dev/null 2>&1 || true
 }
 
 # ---- gitignored progress (processed[]/counters) ----
@@ -104,18 +110,26 @@ load_processed() {
   PROC=()
   while IFS= read -r s; do [ -n "$s" ] && PROC["$s"]=1; done < <(jq -r '.processed[]?' "$PROGRESS")
 }
+requeue_failed() { # print full SHAs of commits recorded as failed on a previous run
+  local s f
+  while IFS= read -r s; do
+    [ -n "$s" ] || continue
+    f="$(g rev-parse --verify --quiet "$s^{commit}" 2>/dev/null || true)"
+    [ -n "$f" ] && printf '%s\n' "$f"
+  done < <(jq -r '.failures[]?' "$PROGRESS" 2>/dev/null)
+}
 
 # ---- auto-commit helpers ----
 commit_docs() { # <short> <subject>
   [ "$AUTO_COMMIT" = true ] || return 0
-  gitw add agent/project
+  gitw add "$DOCS_ROOT"
   gitw diff --cached --quiet >/dev/null 2>&1 && return 0
   local msg; msg="$(sanitize "$2")"
   gitw commit -q -m "docs(${PROJECT}): ${msg}" -m "project commit ${1}" || echo "(commit skipped: nothing staged)"
 }
 commit_baseline_if_dirty() { # <short>
   [ "$AUTO_COMMIT" = true ] || return 0
-  gitw add "$SYNC" 2>/dev/null || gitw add agent/project/.vibedocing.json 2>/dev/null || true
+  gitw add "$SYNC" "$DOCS_ROOT/PROJECT.md" 2>/dev/null || true
   gitw diff --cached --quiet >/dev/null 2>&1 && return 0
   gitw commit -q -m "docs(${PROJECT}): baseline @${1}" || true
 }
@@ -157,18 +171,16 @@ free_tree() { # <path>
   g worktree remove --force "$path" 2>/dev/null || rm -rf "$path"
 }
 
-# ---- cleanup on exit / interrupt: free any in-flight worktree, prune, stop serve ----
+# ---- cleanup on exit / interrupt: free any in-flight worktree, prune ----
 cleanup() {
   if [ -n "${CUR_TREE:-}" ]; then free_tree "$CUR_TREE" 2>/dev/null || true; CUR_TREE=""; fi
   [ -n "${SOURCE_DIR:-}" ] && git -C "$SOURCE_DIR" worktree prune 2>/dev/null || true
-  if [ -n "${SERVE_PID:-}" ]; then kill "$SERVE_PID" 2>/dev/null || true; fi
-  [ -n "${SERVE_LOG:-}" ] && [ -f "$SERVE_LOG" ] && rm -f "$SERVE_LOG" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
 # ---- run one commit ----
 run_one() { # <sha>
-  local sha="$1" short subject path args verdict rc kind extra=""
+  local sha="$1" short subject path args verdict rc kind extra="" parent=""
   short="${SHORT[$sha]}"; subject="${SUBJ[$sha]}"
 
   if [ -n "$SKIP_REGEX" ] && [[ $subject =~ $SKIP_REGEX ]]; then
@@ -181,22 +193,19 @@ run_one() { # <sha>
 
   path="$(make_tree "$sha")"
   CUR_TREE="$path"
-  [ "${CLASSIFY_ONLY:-0}" = 1 ] && extra="classify-only"
-  args="$sha $path"; [ -n "$extra" ] && args="$args $extra"
 
-  local oc=(run --command "$CMD_NAME")
-  [ "$AUTO" = true ] && oc+=(--auto)
-  local model="${OVERRIDE_MODEL:-$CFG_MODEL}"; [ -n "$model" ] && oc+=(--model "$model")
-  [ -n "$CFG_AGENT" ] && oc+=(--agent "$CFG_AGENT")
-  [ -n "$ATTACH" ] && oc+=(--attach "$ATTACH")
-  oc+=("$args")
+  local ag=(python3 -m vibe_agent --config "$CONFIG" --sha "$sha" --worktree "$path"
+            --docs-root "$DOCS_ROOT" --docs-root-rel "$DOCS_ROOT_REL"
+            --verdicts-dir "$VERDICTS")
+  [ "${CLASSIFY_ONLY:-0}" = 1 ] && ag+=(--classify-only)
+  local model="${OVERRIDE_MODEL:-$CFG_MODEL}"; [ -n "$model" ] && ag+=(--model "$model")
 
   echo "[$short] PROCESS       $subject"
   rc=0
   if [ -n "$RUN_TIMEOUT" ] && [ "$RUN_TIMEOUT" != 0 ] && command -v timeout >/dev/null 2>&1; then
-    timeout "${RUN_TIMEOUT}s" opencode "${oc[@]}" > "$RUN_LOGS/$sha.log" 2>&1 || rc=$?
+    timeout "${RUN_TIMEOUT}s" "${ag[@]}" > "$RUN_LOGS/$sha.log" 2>&1 || rc=$?
   else
-    opencode "${oc[@]}" > "$RUN_LOGS/$sha.log" 2>&1 || rc=$?
+    "${ag[@]}" > "$RUN_LOGS/$sha.log" 2>&1 || rc=$?
   fi
   free_tree "$path"
   CUR_TREE=""
@@ -213,11 +222,17 @@ run_one() { # <sha>
     die "stopping at $short"
   fi
 
-  sync_set_baseline "$sha"
   case "$kind" in
-    updated) save_progress --arg b "$sha" '.processed += [$b] | .updated += 1'; commit_docs "$short" "$subject";;
-    skipped) save_progress --arg b "$sha" '.processed += [$b] | .skipped += 1';;
-    *)       save_progress --arg b "$sha" --arg f "$short" '.processed += [$b] | .failed += 1 | .failures += [$f]';;
+    updated) sync_set_baseline "$sha"
+             save_progress --arg b "$sha" '.processed += [$b] | .updated += 1'; commit_docs "$short" "$subject";;
+    skipped) sync_set_baseline "$sha"
+             save_progress --arg b "$sha" '.processed += [$b] | .skipped += 1';;
+    *)       # failure is NOT "processed": roll the baseline back to the parent so
+             # the next run's rev-list range includes this commit again
+             parent="$(g rev-parse --verify --quiet "$sha^" 2>/dev/null || true)"
+             sync_set_baseline "${parent:-}"
+             save_progress --arg b "$sha" --arg f "$short" '.processed += [$b] | .failed += 1 | .failures += [$f]'
+             echo "[$short]    analyze: logs/$sha.log  $( [ -f "$VERDICTS/$sha.transcript.jsonl" ] && echo "verdicts/$sha.transcript.jsonl (python3 -m vibe_agent.transcript <file>)" )";;
   esac
   echo "[$short] -> $kind ($verdict)"
 }
@@ -227,9 +242,10 @@ read -r -d '' USAGE <<'EOF' || true
 Usage: run.sh [options]
 
   (no args)       Run the walk from the committed baseline up to project HEAD.
-  --setup         (re)install command+skill into .opencode/ and exit.
   --list          Show commit list + SKIP/PROCESS decisions, then exit (no agent calls).
   --dry-run       Invoke the agent in classify-only mode (no doc writes, no commits).
+  --validate [S]  Validate existing docs against the tree at commit S (default HEAD):
+                  links, numbering, layout, source paths, stale references. No agent.
   --reset-baseline  Reset the committed baseline to the project's first commit and exit.
   --limit N       Process at most N commits this run.
   --range X       Process commits in range X (e.g. A..B). Overrides baseline.
@@ -237,19 +253,18 @@ Usage: run.sh [options]
   --in-place      Checkout each commit in the source clone instead of a worktree.
   --stop-on-fail  Halt on the first failed commit (default: record and continue).
   --no-commit     Do not git-commit doc changes this run (overrides config auto_commit).
-  --attach U      Attach each run to a running 'opencode serve' at URL U.
-  --model M       Override the model for this run.
-  --serve         Start 'opencode serve' in the background for the run, then stop it.
+  --model M       Override the model for this run (or export VIBE_MODEL).
   --help          Show this help.
 EOF
 
-DO_LIST=0; RESET_BASE=0; DO_SETUP=0; LIMIT=0; RANGE=""; SINGLE=""; ATTACH=""; OVERRIDE_MODEL=""
-STOP_ON_FAIL=0; CLASSIFY_ONLY=0; SERVE=0
+DO_LIST=0; RESET_BASE=0; LIMIT=0; RANGE=""; SINGLE=""; OVERRIDE_MODEL=""
+STOP_ON_FAIL=0; CLASSIFY_ONLY=0; VALIDATE=0; VALIDATE_REF=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --setup) DO_SETUP=1;;
     --list) DO_LIST=1;;
     --dry-run) CLASSIFY_ONLY=1;;
+    --validate) VALIDATE=1
+                if [ $# -ge 2 ] && [[ "$2" != -* ]]; then VALIDATE_REF="$2"; shift; fi;;
     --reset-baseline) RESET_BASE=1;;
     --limit) LIMIT="${2:?--limit needs N}"; shift;;
     --range) RANGE="${2:?--range needs A..B}"; shift;;
@@ -257,18 +272,13 @@ while [ $# -gt 0 ]; do
     --in-place) USE_WORKTREE=false;;
     --stop-on-fail) STOP_ON_FAIL=1;;
     --no-commit) AUTO_COMMIT=false;;
-    --attach) ATTACH="${2:?--attach needs URL}"; shift;;
     --model) OVERRIDE_MODEL="${2:?--model needs M}"; shift;;
-    --serve) SERVE=1;;
     --help|-h) echo "$USAGE"; exit 0;;
     *) die "unknown arg: $1";;
   esac
   shift
 done
-export USE_WORKTREE STOP_ON_FAIL CLASSIFY_ONLY ATTACH OVERRIDE_MODEL
-
-install_into_opencode
-[ "$DO_SETUP" = 1 ] && { echo "Installed command + skill into .opencode/"; exit 0; }
+export USE_WORKTREE STOP_ON_FAIL CLASSIFY_ONLY OVERRIDE_MODEL
 
 init_sync; init_progress
 
@@ -276,19 +286,64 @@ init_sync; init_progress
 
 [ -d "$SOURCE_DIR/.git" ] || die "source_root '$SOURCE_DIR' is not a git repository (set source_root in config.json)"
 
+# ---- standalone validation mode: audit the docs map without any agent calls ----
+if [ "$VALIDATE" = 1 ]; then
+  REF="${VALIDATE_REF:-HEAD}"
+  FULL="$(g rev-parse --verify --quiet "$REF^{commit}" || true)"
+  [ -n "$FULL" ] || die "commit not found for --validate: $REF"
+  load_meta "$FULL"
+  VPATH="$(make_tree "$FULL")"
+  CUR_TREE="$VPATH"
+  python3 -m vibe_agent.validate --docs-root "$DOCS_ROOT" --worktree "$VPATH" \
+    --report "$VERDICTS/validate-${SHORT[$FULL]}.md" --sha "$FULL" \
+    || { free_tree "$VPATH"; CUR_TREE=""; die "validation found errors (see above and $VERDICTS/validate-${SHORT[$FULL]}.md)"; }
+  free_tree "$VPATH"; CUR_TREE=""
+  echo "docs validation passed at ${SHORT[$FULL]}"
+  exit 0
+fi
+
+# fail fast on an obviously missing model config (env VIBE_MODEL overrides)
+[ -n "${OVERRIDE_MODEL:-}" ] || [ -n "$CFG_MODEL" ] || \
+  die "no model configured: set llm.model in config.json or export VIBE_MODEL"
+
 # ---- commit list ----
 rl=(--reverse)
 [ "$SKIP_MERGES" = true ] && rl+=(--no-merges)
-if [ -n "$SINGLE" ]; then SHAS=("$SINGLE")
-elif [ -n "$RANGE" ]; then mapfile -t SHAS < <(g rev-list "${rl[@]}" "$RANGE")
+# optional pathspec scope: process only commits touching the configured subdirectory
+sc=()
+[ -n "$SCOPE" ] && sc=(-- "$SCOPE")
+if [ -n "$SINGLE" ]; then
+  # normalize to the full SHA: SUBJ/SHORT are keyed by full SHAs and `set -u`
+  # aborts on a missing key (e.g. when the user passes a short sha)
+  FULL="$(g rev-parse --verify --quiet "$SINGLE^{commit}" || true)"
+  [ -n "$FULL" ] || die "commit not found in source repo: $SINGLE"
+  SHAS=("$FULL")
+elif [ -n "$RANGE" ]; then mapfile -t SHAS < <(g rev-list "${rl[@]}" "$RANGE" ${sc[@]+"${sc[@]}"})
 else
   BASELINE="$(jq -r '.baseline // ""' "$SYNC")"
-  if [ -z "$BASELINE" ]; then mapfile -t SHAS < <(g rev-list "${rl[@]}" HEAD)
-  else mapfile -t SHAS < <(g rev-list "${rl[@]}" "${BASELINE}..HEAD"); fi
+  if [ -z "$BASELINE" ]; then mapfile -t SHAS < <(g rev-list "${rl[@]}" HEAD ${sc[@]+"${sc[@]}"})
+  else mapfile -t SHAS < <(g rev-list "${rl[@]}" "${BASELINE}..HEAD" ${sc[@]+"${sc[@]}"}); fi
 fi
+load_processed
+
+# ---- retry commits that failed on a previous run (LLM outage, timeouts, ...) ----
+mapfile -t RETRY < <(requeue_failed)
+if [ "${#RETRY[@]}" -gt 0 ]; then
+  drops="$(printf '%s\n' "${RETRY[@]}" | jq -R . | jq -s -c .)"
+  jq --argjson d "$drops" \
+     '(.processed) |= map(select(. as $p | ($d | index($p)) == null)) | .failures = [] | .failed = 0' \
+     "$PROGRESS" > "$PROGRESS.tmp" && mv "$PROGRESS.tmp" "$PROGRESS"
+  for sha in "${RETRY[@]}"; do
+    unset "PROC[$sha]" 2>/dev/null || true
+    if [ "${#SHAS[@]}" -eq 0 ] || ! printf '%s\n' "${SHAS[@]}" | grep -qx "$sha"; then
+      SHAS+=("$sha")
+    fi
+  done
+  echo "requeuing ${#RETRY[@]} previously failed commit(s) for retry"
+fi
+
 [ "${#SHAS[@]}" -gt 0 ] || { echo "No new commits to process (baseline is at HEAD)."; exit 0; }
 
-load_processed
 load_meta "${SHAS[@]}"
 
 # ---- list mode ----
@@ -306,26 +361,16 @@ if [ "$DO_LIST" = 1 ]; then
   exit 0
 fi
 
-# ---- optional managed server ----
-if [ "$SERVE" = 1 ] && [ -z "$ATTACH" ]; then
-  SERVE_PORT="${SERVE_PORT:-4096}"
-  SERVE_LOG="$(mktemp -t vibe-serve.XXXXXX.log)" || die "mktemp failed"
-  echo "Starting opencode serve on port $SERVE_PORT (log: $SERVE_LOG) …"
-  opencode serve --port "$SERVE_PORT" >"$SERVE_LOG" 2>&1 &
-  SERVE_PID=$!; ATTACH="http://localhost:$SERVE_PORT"
-  sleep 3
-fi
-
 {
   echo "=== vibe-walk started $(date -Iseconds) ==="
-  echo "project=$PROJECT source=$SOURCE_REL branch=$BRANCH commits=${#SHAS[@]} worktree=$USE_WORKTREE classify=$CLASSIFY_ONLY commit=$AUTO_COMMIT"
+  echo "project=$PROJECT source=$SOURCE_REL branch=$BRANCH commits=${#SHAS[@]} worktree=$USE_WORKTREE classify=$CLASSIFY_ONLY commit=$AUTO_COMMIT model=${OVERRIDE_MODEL:-$CFG_MODEL}"
 } | tee -a "$WALK_LOG"
 
 count=0; last_short=""
 for sha in "${SHAS[@]}"; do
   [[ -v PROC["$sha"] ]] && continue
   [ "$LIMIT" -gt 0 ] && [ "$count" -ge "$LIMIT" ] && { echo "Reached --limit $LIMIT; stopping." | tee -a "$WALK_LOG"; break; }
-  count=$((count+1)); last_short="${SHORT[$sha]}"
+  count=$((count+1)); last_short="${SHORT[$sha]:-??????????}"
   run_one "$sha" 2>&1 | tee -a "$WALK_LOG"
 done
 

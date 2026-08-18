@@ -15,13 +15,25 @@ When you document, follow this methodology **and** the project conventions toget
 the conventions file is missing, infer defaults from the source tree and flag
 uncertainties in the doc footer.
 
-The documentation lives in `agent/project/` and mirrors the real source tree of the
-project under review.
+The documentation lives in `agent/project/` and maps the capabilities of the project
+under review.
+
+> **The docs folder layout is fixed.** The docs root contains *exactly*:
+> `update-documents.md`, `project-conventions.md`, `PROJECT.md`, `functions/`, and
+> `design/` — nothing else. Do not create any other files or subfolders, do not nest a
+> copy of the docs root inside itself (no `agent/` or `project/` subfolder), and do not
+> mirror the source tree's directory names (no `<source-root>/functions/...`).
+
+> **Path resolution:** the locations below are written relative to the *repository
+> root* (`agent/project/...`) for human readers. When the pipeline's agent writes docs
+> via its `write_doc` tool, paths resolve against the **DOCS ROOT itself** — pass
+> `functions/03-foo.md`, **not** `agent/project/functions/03-foo.md`. The tool
+> enforces the fixed layout and auto-strips accidental `agent/project/` prefixes.
 
 > Two modes of operation:
-> - **Incremental (per-commit)** — driven by `agent/vibedocing/run.sh`, which replays
->   the project commit-by-commit (stateful replay) and invokes the `vibe-commit` command
->   for each. See *Incremental mode* below.
+> - **Incremental (per-commit)** — driven by the pipeline's `run.sh`, which replays
+>   the project commit-by-commit (stateful replay) and invokes the built-in
+>   `vibe-agent` CLI for each. See *Incremental mode* below.
 > - **Manual** — a human or agent edits docs directly following the same rules.
 
 ## Core Goal
@@ -68,8 +80,8 @@ Brief description of what this function does from the user's perspective.
 ### Technical Details
 - [Related Design Document](../design/<number>-<name>.md) - Design overview
 ### Source Files
-- <source-root-relative>/path/to/file.ext - Main implementation
-- <source-root-relative>/path/to/other.ext - Supporting code
+- src/path/to/file.ext - Main implementation
+- src/path/to/other.ext - Supporting code
 ### Related Functions
 - [Related Function](./<number>-<name>.md) - Connection description
 
@@ -96,13 +108,13 @@ Brief overview of the design area.
 
 ## Architecture / Components
 ### Component Name
-**File:** <source-root-relative>/path/to/file.ext
+**File:** src/path/to/file.ext
 **Purpose:** What this component does
 **Features:**
 - Feature 1
 **API / Interface:**
 ```<lang>
-// code example / interface shape
+// code example / interface shape — copied VERBATIM from the source file
 ```
 
 ## Design Decisions
@@ -110,7 +122,7 @@ Key decisions and rationale.
 
 ## Source Files
 ### Category
-- <source-root-relative>/path/to/file.ext - Description
+- src/path/to/file.ext - Description
 
 ---
 *Last updated: YYYY-MM-DD*
@@ -119,9 +131,15 @@ Key decisions and rationale.
 **Update when:** architecture changes; new components; design patterns change; source
 organization changes.
 
-> **`<source-root-relative>`** means a path relative to the project's source root as
-> configured in `agent/vibedocing/config.json` (`source_root`). The conventions file
-> states the canonical prefix to use (e.g. `packages/<pkg>/src/...` or `src/...`).
+> **Source path style:** cite source files as paths **relative to the repository root**
+> — exactly as they appear in the commit worktree (e.g. `src/...`, `cmd/.../main.go`,
+> `testData/...`). The worktree root IS the repository root. Never prefix paths with the
+> workspace/source-root folder name from `config.json` (`source_root` is where the clone
+> lives in the workspace, not part of the repo); such paths do not resolve and fail
+> validation. Every identifier and signature must be copied **verbatim** from a source
+> file read in the current session — the repository at the commit under review is the
+> only source of truth, not prior knowledge of the project (other versions, forks,
+> upstream articles).
 
 ---
 
@@ -170,21 +188,55 @@ is almost always obvious from the diff.
    rewrite untouched areas. Do not fabricate.
 
 ### Step 3 — Emit a verdict
-After deciding, write exactly one line to the verdict file the runner gave you
-(`agent/vibedocing/verdicts/<sha>.txt`):
-- `VERDICT: NO_DOC` — classified as skip, nothing written.
-- `VERDICT: DOC_UPDATED <comma-separated relative doc paths>` — docs were created/changed.
+After deciding, end by calling the `finish` tool exactly once (the runner writes the
+artifact files; the agent's verdict is recorded in `vibedocing/verdicts/<sha>.json`
+plus a one-line `<sha>.txt` for the bash loop):
+- `NO_DOC` — classified as skip, nothing written.
+- `DOC_UPDATED <comma-separated relative doc paths>` — docs were created/changed.
 In `classify-only` (dry-run) mode, decide and emit the verdict **without writing any docs**.
 
-### Handling the "giant initial commit"
-Some projects begin with one massive commit containing the whole codebase. At that commit
-the agent may need to document many things at once. Strategies (apply as needed):
-- Focus on **entry points and top-level modules** for that commit; let later commits fill
-  in detail (idempotency means later passes refine, not duplicate).
-- If the diff is overwhelming, document the **module map** and the most prominent
-  user-facing functions; mark the rest with a TODO footer for refinement.
-- The pipeline can be **scoped** to a subdirectory via config (`scope`) to chunk a huge
-  initial pass.
+### Renames, moves and deletions (path hygiene)
+The first user message always includes a rename-aware **NAME STATUS** (`git diff
+--name-status -M`) and, when existing docs cite paths renamed/deleted by the commit, a
+precomputed **STALE DOC REFERENCES** worklist. Then:
+- A commit that renames/moves/deletes files cited in docs is **DOCUMENT** (path-fix
+  pass), even when it otherwise looks like a refactor.
+- Use the `search_docs` tool to find **every** doc mentioning the old path; replace
+  with the new path (R) or remove/rewrite the reference (D). Also fix navigation
+  links in `PROJECT.md` that point to renamed docs.
+- Rationale: a documentation map that still points at pre-rename paths is worse than
+  no map at all — the reader cannot find the code.
+
+### Automated validation (quality gate)
+After every `DOC_UPDATED` verdict the pipeline validates the docs map mechanically:
+1. **layout** — only the fixed docs-root entries exist (`PROJECT.md`,
+   `update-documents.md`, `project-conventions.md`, `functions/`, `design/`);
+2. **naming** — `functions/` and `design/` files match `<number>-<name>.md`, numbers
+   unique per directory (gaps are warned);
+3. **links** — every relative markdown link resolves to an existing doc;
+4. **paths** — cited repository paths (anything path-shaped with a slash and a file
+   extension) exist in the worktree at this commit;
+5. **stale refs** — no doc cites a path renamed/deleted by this commit.
+
+Problems are fed back to the agent for up to `validation.rounds` repair rounds
+(config). If deterministic errors remain in `strict` mode (default), the verdict
+becomes `ERROR` and the commit is requeued — broken docs are never published. Audit
+an existing docs map any time with `run.sh --validate [sha]`.
+
+### Handling the "giant initial commit" (INITIAL SNAPSHOT mode)
+Some projects begin with one massive commit containing the whole codebase. The
+pipeline detects root commits (no parent) automatically and switches the agent to
+**INITIAL SNAPSHOT** mode:
+- the diffstat is replaced by a **TREE DIGEST** (real directories + file counts from
+  `git ls-tree`), and the step budget is raised (`llm.max_steps_initial`);
+- the agent must build the module/package map from the digest and the worktree —
+  never from prior knowledge of the project (older versions, forks, upstream docs);
+  every package, class and entry point it names must be verified in the worktree;
+- coverage is allowed to be partial: document entry points, top-level architecture
+  and the most prominent user-facing functions; later commits refine the map
+  idempotently. A correct partial map beats an inventive complete one;
+- to chunk a huge first pass further, set `scope` in config to a subdirectory
+  (pathspec filter on which commits are processed) and run multiple passes.
 
 ---
 
@@ -210,33 +262,42 @@ helper class is not a function (it belongs in a design doc, if anywhere).
 
 ## Documentation Principles
 
-1. **Developer-centric** — include full source paths (relative to source root), short
-   interface/API snippets, and links to authoritative convention notes.
+1. **Developer-centric** — include full repository-root-relative source paths, short
+   interface/API snippets copied verbatim from the source, and links to authoritative
+   convention notes.
 2. **Traceability** — every function links to source; every design links to
    implementation; every doc carries an `*Areas:*` tag and a timestamp.
-3. **Hierarchy** — `PROJECT.md` navigates; function docs say *what*; design docs say
+3. **Ground truth** — the repository at the commit under review is the only source;
+   no identifiers from memory, no facts from other versions or forks of the project.
+4. **Hierarchy** — `PROJECT.md` navigates; function docs say *what*; design docs say
    *how/why*. Detail increases top → bottom.
-4. **Maintainability** — consistent templates; one topic per file; bump timestamps on
+5. **Maintainability** — consistent templates; one topic per file; bump timestamps on
    edit.
-5. **High signal / low noise** — document capabilities and architecture, not history.
-6. **Idempotency** — re-running over the same commits must refine, never duplicate.
+6. **High signal / low noise** — document capabilities and architecture, not history.
+7. **Idempotency** — re-running over the same commits must refine, never duplicate.
 
 ## File Organization
 ```
-agent/project/
-├── update-documents.md          # this generic methodology
-├── project-conventions.md       # per-project specifics (language, paths, branch, areas)
-├── PROJECT.md                   # Level 1: navigation hub
-├── functions/                   # Level 2: function docs
-└── design/                      # Level 3: technical design docs
+<repository root>/
+└── agent/project/                 # the docs root (DOCS ROOT for the pipeline agent)
+    ├── update-documents.md        # this generic methodology
+    ├── project-conventions.md     # per-project specifics (language, paths, branch, areas)
+    ├── PROJECT.md                 # Level 1: navigation hub
+    ├── functions/                 # Level 2: function docs (only *.md, one level deep)
+    └── design/                    # Level 3: technical design docs (only *.md, one level deep)
 ```
 
+No other files or subfolders belong under the docs root.
+
 ## DO / DON'T
-**DO:** update timestamps; link related docs; use full source-root-relative paths; keep
-docs in sync with code; tag areas; check existing docs before creating new ones.
+**DO:** update timestamps; link related docs; use repository-root-relative source paths;
+keep docs in sync with code (including renames and deletions); tag areas; check existing
+docs before creating new ones; copy signatures and option keys verbatim from the source.
 **DON'T:** duplicate content across docs; put implementation detail in function docs;
-leave broken links; forget `PROJECT.md` navigation; use vague filenames; document bug
-fixes or formatting; fabricate changes that aren't in the commit.
+leave broken links; cite files that no longer exist at the commit under review; prefix
+paths with the workspace folder name; invent identifiers from prior knowledge of the
+project; forget `PROJECT.md` navigation; use vague filenames; document bug fixes or
+formatting; fabricate changes that aren't in the commit.
 
 ---
 *Last updated: 2026-07-17*
