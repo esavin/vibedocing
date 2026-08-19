@@ -25,7 +25,7 @@ from .agent import run_agent
 from .config import ConfigError, load_config, resolve_llm
 from .llm import ChatClient, FatalLLMError
 from .prompt import (InspectError, SYSTEM_PROMPT, build_first_user,
-                     sha_looks_valid)
+                     build_reconsider_message, load_prior_hint, sha_looks_valid)
 from .tools import ToolSet
 from .transcript import Transcript
 from .validate import format_report, repair_message, validate_docs
@@ -49,6 +49,12 @@ def parse_args(argv):
                         help="directory for verdict files")
     parser.add_argument("--classify-only", action="store_true",
                         help="decide and report without writing docs")
+    parser.add_argument("--prior-verdict", default="",
+                        help="verdict JSON from a previous run (DOC_UPDATED "
+                             "hint; enables the reconsideration round)")
+    parser.add_argument("--prior-docs", default="",
+                        help="docs root of the previous run, to read the hint "
+                             "docs from")
     parser.add_argument("--model", default="", help="override the configured model")
     parser.add_argument("--max-steps", type=int, default=0,
                         help="override the max agent steps")
@@ -182,6 +188,23 @@ def main(argv=None):
 
     last_validation = None
 
+    # --doc-hints: prior run documented this commit; if the agent finishes
+    # NO_DOC, feed the prior run's actual docs back for one reconsideration
+    # round (see agent.run_agent).
+    reconsider = None
+    reconsider_state = {"fired": False}
+    if args.prior_verdict and args.prior_docs:
+        prior_hint = load_prior_hint(args.prior_verdict, args.prior_docs,
+                                     args.docs_root_rel)
+        if prior_hint is not None:
+            def reconsider(hint=prior_hint):
+                message = build_reconsider_message(hint,
+                                                   args.classify_only)
+                reconsider_state["fired"] = bool(message)
+                return message
+            log("prior-run hint loaded: %d doc(s) eligible for reconsideration"
+                % len(prior_hint["docs"]))
+
     def validator():
         """Called by the agent loop after a DOC_UPDATED finish (repair rounds)."""
         problems = validate_docs(docs_root, worktree, old_paths, path_check)
@@ -230,7 +253,7 @@ def main(argv=None):
             verdict = run_agent(client, tools, SYSTEM_PROMPT, first_user,
                                 max_steps, log,
                                 validator=validator, repair_rounds=val_rounds,
-                                transcript=transcript)
+                                transcript=transcript, reconsider=reconsider)
         except FatalLLMError as exc:
             verdict = {"verdict": "ERROR", "files": [], "reason":
                        "llm: %s" % exc, "steps": 0,
@@ -267,6 +290,8 @@ def main(argv=None):
     verdict["mode"] = mode
     verdict["sha"] = args.sha
     verdict["root_commit"] = root_commit
+    if reconsider_state["fired"]:
+        verdict["reconsidered"] = True
     if transcript is not None:
         verdict["transcript"] = os.path.basename(transcript.path)
     if last_validation is not None:

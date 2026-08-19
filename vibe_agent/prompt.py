@@ -7,6 +7,7 @@ for the root (initial snapshot) commit — a directory digest of the real tree, 
 agent never has to invent a module map from prior knowledge of the project.
 """
 
+import json
 import os
 import re
 import subprocess
@@ -514,3 +515,112 @@ _SHA_RE = re.compile(r"^[0-9a-fA-F]{4,40}$")
 
 def sha_looks_valid(sha):
     return bool(sha) and bool(_SHA_RE.match(sha))
+
+
+# ---- prior-run doc hints (--doc-hints reconsideration round) ----
+# Caps keep the injected prior docs comparable to the commit context itself:
+# big enough to judge substance, small enough not to crowd out the diff.
+HINT_MAX_FILES = 6
+HINT_MAX_FILE_CHARS = 16_000
+HINT_MAX_TOTAL_CHARS = 48_000
+
+
+def load_prior_hint(prior_verdict_path, prior_docs_root, docs_root_rel):
+    """Load a previous run's DOC_UPDATED verdict plus the docs it produced.
+
+    Returns {"files": [...], "reason": str, "docs": [(rel, content-or-None)]}
+    or None when the hint is unusable (missing/unreadable verdict, verdict is
+    not DOC_UPDATED, or no files listed). Each file is read from the PRIOR run's
+    docs root, tolerating both workspace-relative ("agent/project/functions/
+    x.md") and docs-root-relative ("functions/x.md") spellings; unreadable
+    files are kept as (rel, None) so the message can say so.
+    """
+    try:
+        with open(prior_verdict_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict) or data.get("verdict") != "DOC_UPDATED":
+        return None
+    files = []
+    for item in data.get("files") or []:
+        text = str(item).strip().replace("\\", "/")
+        if text and text not in files:
+            files.append(text)
+    if not files:
+        return None
+    prefix = (docs_root_rel or "").strip("/")
+    docs = []
+    for rel in files[:HINT_MAX_FILES]:
+        candidates = [rel]
+        if prefix:
+            if rel.startswith(prefix + "/"):
+                candidates.append(rel[len(prefix) + 1:])
+            else:
+                candidates.append(prefix + "/" + rel)
+        content = None
+        for cand in candidates:
+            path = os.path.normpath(os.path.join(prior_docs_root, cand))
+            if os.path.isfile(path):
+                try:
+                    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                        content = fh.read(HINT_MAX_FILE_CHARS)
+                except OSError:
+                    content = None
+                break
+        docs.append((rel, content))
+    return {"files": files, "reason": str(data.get("reason") or ""),
+            "docs": docs}
+
+
+def build_reconsider_message(hint, classify_only=False):
+    """The one-shot reconsideration user message fed back after a NO_DOC finish
+    when a previous run documented the same commit (--doc-hints)."""
+    parts = []
+    total = 0
+    for rel, content in hint["docs"]:
+        if content is None:
+            parts.append("=== %s ===\n(file not found in the prior run's docs "
+                         "map - judge from the diff alone)" % rel)
+            continue
+        if total >= HINT_MAX_TOTAL_CHARS:
+            parts.append("=== %s ===\n(skipped: hint size cap reached)" % rel)
+            continue
+        if len(content) > HINT_MAX_FILE_CHARS:
+            content = content[:HINT_MAX_FILE_CHARS] + "\n... [truncated]"
+        if total + len(content) > HINT_MAX_TOTAL_CHARS:
+            content = (content[:HINT_MAX_TOTAL_CHARS - total]
+                       + "\n... [truncated]")
+        total += len(content)
+        parts.append("=== %s ===\n%s" % (rel, content))
+    extra = ""
+    if len(hint["files"]) > HINT_MAX_FILES:
+        extra = "\n(+%d more file(s) from the prior verdict not shown)\n" \
+                % (len(hint["files"]) - HINT_MAX_FILES)
+    action = ("report DOC_UPDATED with the files you would have written"
+              if classify_only else
+              "write the corresponding docs now (write_doc), ADAPTED to the "
+              "current map state (numbering, links, cited paths), then finish "
+              "with DOC_UPDATED")
+    reason = ("Prior run's finish reason: %s\n" % hint["reason"]
+              if hint["reason"] else "")
+    return (
+        "RECONSIDER - prior-run documentation hint for THIS commit.\n"
+        "\n"
+        "An earlier run of this pipeline classified this commit as DOC_UPDATED "
+        "and produced the documentation attached below. You have just finished "
+        "with NO_DOC. The two runs can legitimately disagree (the docs map "
+        "state differs, conventions may have changed), so make the final call "
+        "explicitly instead of by sampling noise:\n"
+        "- if the capability/design described below is real for THIS commit's "
+        "diff and is NOT already covered by the current docs map, %s;\n"
+        "- if the current map already covers it adequately, or the prior doc "
+        "is stale or wrong for this diff, keep NO_DOC and justify briefly in "
+        "the finish reason.\n"
+        "\n"
+        "The prior docs are reference material - do NOT copy them blindly; "
+        "re-check numbering, links, and cited paths against the CURRENT map.\n"
+        "%s%s\n"
+        "This reconsideration is offered exactly once: call finish now with "
+        "your FINAL verdict." % (action, reason, extra)
+    ) + "\n" + "\n\n".join(parts)
