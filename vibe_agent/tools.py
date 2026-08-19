@@ -23,6 +23,8 @@ import re
 import shlex
 import subprocess
 
+from .validate import _NUMBER_RE, _path_candidates
+
 GIT_SUBCOMMANDS = {"show", "log", "diff", "ls-tree", "grep"}
 GIT_FORBIDDEN_EXACT = {"-c", "--output", "--ext-diff", "--textconv",
                        "--open-files-in-pager"}
@@ -65,6 +67,7 @@ class ToolSet(object):
         self.read_roots = [self.worktree, self.docs_root]
         self.finish_result = None
         self.wrote_docs = False  # any successful write_doc call this session
+        self.written_files = []  # docs-root-relative paths written/deleted
         # Workspace-relative prefixes of the docs root ('agent/project',
         # 'project', ...): models keep trying read_file('agent/project/x.md')
         # although paths must be docs-root-relative. write_doc already strips
@@ -172,20 +175,42 @@ class ToolSet(object):
                 "function": {
                     "name": "write_doc",
                     "description": (
-                        "Create or overwrite a documentation markdown file. The path "
-                        "is docs-root-relative (or absolute inside the docs root) and "
-                        "must follow the fixed layout: functions/<number>-<name>.md, "
-                        "design/<number>-<name>.md, PROJECT.md, project-conventions.md, "
-                        "or update-documents.md. Never prefix with agent/ or "
-                        "agent/project/ and never mirror source-tree folders."
+                        "Create or overwrite a documentation markdown file, "
+                        "append a part to one (append: true - for docs too "
+                        "long for a single call), or delete one (delete: true "
+                        "- use it ONLY to remove a duplicate/obsolete doc "
+                        "after merging its content into another doc). The path "
+                        "is docs-root-relative (or absolute inside the docs "
+                        "root) and must follow the fixed layout: "
+                        "functions/<number>-<name>.md, "
+                        "design/<number>-<name>.md, PROJECT.md, "
+                        "project-conventions.md, or update-documents.md. A NEW "
+                        "numbered doc MUST take the lowest free number in ITS "
+                        "directory (checked at write time - the error names "
+                        "the exact expected path); never continue another "
+                        "directory's numbering. Never "
+                        "prefix with agent/ or agent/project/ and never mirror "
+                        "source-tree folders. Keep each call's content under "
+                        "~150 lines: if a write gets cut off by the output "
+                        "token limit, write the first half now and append the "
+                        "rest with follow-up append calls. The result carries "
+                        "a warning listing cited repository paths missing from "
+                        "the worktree - fix them before finishing."
                     ),
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "path": {"type": "string"},
                             "content": {"type": "string"},
+                            "append": {"type": "boolean",
+                                       "description": "append content to the "
+                                                      "existing doc instead "
+                                                      "of overwriting"},
+                            "delete": {"type": "boolean",
+                                       "description": "delete the doc instead of "
+                                                      "writing it"},
                         },
-                        "required": ["path", "content"],
+                        "required": ["path"],
                     },
                 },
             },
@@ -480,11 +505,8 @@ class ToolSet(object):
                     "error": "classify-only mode: writes are disabled; call finish with"
                              " the verdict you would have produced"}
         raw = args.get("path")
-        content = args.get("content")
         if not isinstance(raw, str) or not raw.strip():
             return {"ok": False, "error": "path must be a non-empty string"}
-        if not isinstance(content, str):
-            return {"ok": False, "error": "content must be a string"}
         raw = raw.strip()
         if os.path.isabs(raw):
             target = os.path.realpath(raw)
@@ -504,16 +526,107 @@ class ToolSet(object):
             note = "path normalized from '%s'" % rel
             target = os.path.join(self.docs_root, *fixed.split("/"))
             rel = fixed
+        # per-directory sequential numbering, enforced at write time for NEW
+        # files: a weak model continues whichever counter it saw last (design/
+        # numbering leaked into functions/ as 01-09 then 22-25, leaving 10-21
+        # free forever). Overwriting an EXISTING path is always allowed.
+        if ("/" in rel and not os.path.exists(target)
+                and args.get("delete") is not True):
+            directory, _, fname = rel.partition("/")
+            match = _NUMBER_RE.match(fname)
+            if match:
+                siblings = {}
+                dpath = os.path.join(self.docs_root, directory)
+                if os.path.isdir(dpath):
+                    for name in sorted(os.listdir(dpath)):
+                        if name.startswith(".") or not name.lower().endswith(".md"):
+                            continue
+                        m2 = _NUMBER_RE.match(name)
+                        if m2:
+                            siblings.setdefault(int(m2.group(1)), name)
+                lowest = 1
+                while lowest in siblings:
+                    lowest += 1
+                number = int(match.group(1))
+                if number in siblings:
+                    return {"ok": False,
+                            "error": "numbering: number %s is already taken by "
+                                     "%s/%s - do NOT create a second doc with "
+                                     "it; update THAT file instead (or merge "
+                                     "and delete the redundant one)"
+                                     % (match.group(1), directory,
+                                        siblings[number])}
+                if number > lowest:
+                    new_rel = "%s/%02d-%s" % (directory, lowest,
+                                              fname[match.end():])
+                    return {"ok": False,
+                            "error": "numbering: %s has free numbers below %s - "
+                                     "write this doc as '%s' instead "
+                                     "(per-directory sequential numbering)"
+                                     % (directory, match.group(1), new_rel)}
+        if args.get("delete") is True:
+            # deleting a doc is allowed only inside functions/ or design/ and
+            # only for merging duplicates/obsoletes - never the fixed files
+            if rel.lower() in DOCS_TOP_FILES:
+                return {"ok": False,
+                        "error": "refused: %s is a fixed top-level doc - it "
+                                 "cannot be deleted, only rewritten" % rel}
+            if not os.path.isfile(target):
+                return {"ok": False,
+                        "error": "nothing to delete: '%s' does not exist" % rel}
+            os.remove(target)
+            self.wrote_docs = True
+            if rel not in self.written_files:
+                self.written_files.append(rel)
+            return {"ok": True, "deleted": rel}
+        content = args.get("content")
+        if not isinstance(content, str):
+            return {"ok": False, "error": "content must be a string"}
+        append = args.get("append") is True
+        if append and not os.path.isfile(target):
+            return {"ok": False,
+                    "error": "append: '%s' does not exist yet - write it first "
+                             "without append, then append the following parts"
+                             % rel}
         parent = os.path.dirname(target)
         if parent != self.docs_root and not parent.startswith(self.docs_root + os.sep):
             return {"ok": False, "error": "refused: parent escapes the docs root"}
         os.makedirs(parent, exist_ok=True)
-        with open(target, "w", encoding="utf-8") as fh:
+        mode = "a" if append else "w"
+        with open(target, mode, encoding="utf-8") as fh:
+            if append and content and not content.startswith("\n"):
+                fh.write("\n")
             fh.write(content)
         self.wrote_docs = True
-        result = {"ok": True, "written": len(content.encode("utf-8")), "path": rel}
+        if rel not in self.written_files:
+            self.written_files.append(rel)
+        result = {"ok": True, "written": len(content.encode("utf-8")),
+                  "path": rel}
+        if append:
+            result["appended"] = True
         if note:
             result["note"] = note
+        # write-time path lint (same rules as the post-finish validator): a
+        # dead repository path costs a repair round if left to the validator -
+        # telling the model NOW usually fixes it in the next step
+        missing = []
+        seen = set()
+        for line in content.splitlines():
+            for token in _path_candidates(line):
+                if token in seen:
+                    continue
+                seen.add(token)
+                if not os.path.exists(os.path.join(self.worktree, token)):
+                    missing.append(token)
+                    if len(missing) >= 10:
+                        break
+            if len(missing) >= 10:
+                break
+        if missing:
+            result["warning"] = (
+                "cited path(s) not found in the worktree at this commit "
+                "(fix or remove BEFORE finishing - they WILL fail validation): %s"
+                % ", ".join(missing))
         return result
 
     def _tool_finish(self, args):

@@ -104,8 +104,13 @@ def check_naming(docs_root, errors, warnings):
             numbers.setdefault(number, []).append(name)
         for number, names in sorted(numbers.items()):
             if len(names) > 1:
-                errors.append("naming: duplicate number %s in %s/: %s"
-                              % (number, directory, ", ".join(names)))
+                errors.append(
+                    "naming: duplicate number %s in %s/: %s. Keep ONE of these "
+                    "files (merge the content if both have value) and DELETE the "
+                    "others with write_doc({\"path\": \"%s/<file>\", "
+                    "\"delete\": true}). Do NOT create yet another numbered file "
+                    "for this topic."
+                    % (number, directory, ", ".join(names), directory))
         if numbers:
             highest = max(int(n) for n in numbers)
             if highest > len(numbers):
@@ -173,7 +178,10 @@ def check_stale(docs_root, old_paths, errors):
         if not text:
             continue
         for old in old_paths:
-            if old in text:
+            # boundary check: an old path EXTENDED with more filename
+            # characters is a different, valid path - 'build.gradle' inside
+            # 'build.gradle.kts' must NOT count as a stale citation
+            if re.search(re.escape(old) + r"(?![\w.\-/])", text):
                 errors.append("%s: still cites '%s' (renamed/deleted by this commit)"
                               % (rel, old))
 
@@ -217,6 +225,19 @@ def repair_message(problems, rounds_left):
         "finish again with verdict DOC_UPDATED listing every file you modified "
         "(across all rounds).",
     ]
+    if any("duplicate number" in item for item in problems["errors"]):
+        parts.append(
+            "DUPLICATE NUMBERING: two or more docs share a number. Merge their "
+            "content into the single best file, then DELETE every redundant file "
+            "with write_doc({\"path\": ..., \"delete\": true}). Creating yet "
+            "another NEW numbered file for the topic is WRONG - it adds another "
+            "duplicate.")
+    if any("does not exist in the repository" in item for item in problems["errors"]):
+        parts.append(
+            "DEAD PATHS: a file was renamed or moved by this commit (see the "
+            "grouped renames in NAME STATUS). Update each cited path to its NEW "
+            "location in the worktree, or remove the citation - never keep a "
+            "path that does not exist at this commit.")
     if problems["errors"]:
         parts.append("Errors (must fix):")
         parts.extend("- %s" % item for item in problems["errors"])
