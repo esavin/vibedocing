@@ -139,6 +139,8 @@ class ChatClient(object):
         # reasoning_content, which strict gateways reject on the next request.
         content = ChatClient._rm_think(message.get("content"))
         clean = {"role": message.get("role") or "assistant", "content": content}
+        # Flat internal shape: name/arguments at the top level. agent.py and
+        # the transcript iterate tool_calls with call["name"]/["arguments"]/["id"].
         tool_calls = []
         for call in (message.get("tool_calls") or []):
             function = call.get("function") or {}
@@ -149,7 +151,22 @@ class ChatClient(object):
                 "arguments": function.get("arguments") or "{}",
             })
         if tool_calls:
-            clean["tool_calls"] = tool_calls
+            # OpenAI-compatible serialization for the NEXT request: strict
+            # gateways (e.g. api.ai.gnivc.ru, Rust/Serde) reject the flattened
+            # top-level name/arguments as "missing field `function`" once the
+            # assistant's tool calls are echoed back with the tool results.
+            # Re-nest them under "function" for the message body only.
+            clean["tool_calls"] = [
+                {
+                    "id": call["id"],
+                    "type": "function",
+                    "function": {
+                        "name": call["name"],
+                        "arguments": call["arguments"],
+                    },
+                }
+                for call in tool_calls
+            ]
         elif clean["content"] is None:
             clean["content"] = ""
         usage = data.get("usage") or {}
