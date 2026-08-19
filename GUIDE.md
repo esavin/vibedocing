@@ -245,8 +245,10 @@ PYTHONPATH=vibedocing python3 -m vibe_agent --config vibedocing/config.json \
     with a final finish-only grace round when docs were written.
   Note: a genuinely *exceeded* context window surfaces differently — as
   `ERROR llm: HTTP 400 … context length …`, not as max_steps.
-- **worktree add failed** — rerun (worktrees are force-removed first); or
-  `git -C <source> worktree prune`.
+- **worktree add failed** — stale worktree registrations are pruned automatically
+  before every add, and the die message now includes git's stderr; if it still
+  happens, inspect `git -C <source> worktree list` / run `git -C <source>
+  worktree prune` by hand.
 - **Agent wrote no verdict** → recorded as `failed`; inspect `logs/<sha>.log`. Use
   `--stop-on-fail` to halt on the first one, or `--sha <sha> --dry-run` to test one commit.
 - **`no model configured`** — set `llm.model` in `config.json`, or `export VIBE_MODEL=…`,

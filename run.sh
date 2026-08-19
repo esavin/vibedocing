@@ -223,11 +223,14 @@ load_meta() { # <sha...>
 
 # ---- worktree lifecycle ----
 make_tree() { # <sha>
-  local sha="$1" path
+  local sha="$1" path out
   [ -n "${SHORT[$sha]:-}" ] || die "no short sha loaded for $sha (call load_meta first)"
   if [ "$USE_WORKTREE" = true ]; then
     path="$TREES/${SHORT[$sha]}"; rm -rf "$path"
-    g worktree add --detach "$path" "$sha" >/dev/null 2>&1 || die "worktree add failed for ${SHORT[$sha]}"
+    # clear dangling registrations from crashed runs: a stale .git/worktrees entry
+    # for a now-deleted path makes `worktree add` refuse the path
+    g worktree prune 2>/dev/null || true
+    out="$(g worktree add --detach "$path" "$sha" 2>&1 >/dev/null)" || die "worktree add failed for ${SHORT[$sha]}: $out"
     echo "$path"
   else
     [ -z "$(g status --porcelain)" ] || die "in-place mode needs a clean source clone; commit/stash first"
@@ -239,7 +242,11 @@ free_tree() { # <path>
   local path="$1"
   [ "$USE_WORKTREE" = true ] || { g checkout -q "$BRANCH" 2>/dev/null || true; return 0; }
   [ "$path" != "$SOURCE_DIR" ] || return 0
-  g worktree remove --force "$path" 2>/dev/null || rm -rf "$path"
+  if ! g worktree remove --force "$path" 2>/dev/null; then
+    # plain rm -rf leaves a dangling .git/worktrees registration that breaks the
+    # next `worktree add` for this path — always prune after the fallback
+    rm -rf "$path"; g worktree prune 2>/dev/null || true
+  fi
 }
 
 # ---- cleanup on exit / interrupt: free any in-flight worktree, prune ----
