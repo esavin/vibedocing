@@ -14,6 +14,12 @@
 # agent/project/.vibedocing.json. After you pull new changes into the project, re-running
 # documents only baseline..HEAD.
 #
+# Fresh-workspace reruns: --reuse-verdicts <dir> replays NO_DOC verdicts from a previous
+# run's verdicts/ folder (--skip-list <file> lists SHAs by hand), so commits already
+# decided SKIP cost no agent calls. With --doc-hints, commits the prior run DOCUMENTED
+# get a reconsideration round: a NO_DOC finish is held back while the prior run's
+# actual doc content is fed back to the agent for one re-examination.
+#
 # Auto-commit: when the agent changes docs, this script commits them to the workspace git
 # repo (the project folder and this tooling folder are gitignored). One commit per
 # documented project commit, plus a trailing baseline commit if needed.
@@ -41,6 +47,9 @@ TREES="$WORK_DIR/.vibe-trees"
 export PYTHONPATH="$PIPELINE_DIR${PYTHONPATH:+:$PYTHONPATH}"
 
 declare -A SUBJ SHORT PROC
+declare -A CACHED_SKIP   # sha -> source <sha>.txt (abs path) | "list" — preseeded NO_DOC
+declare -A PRIOR_DOC     # sha -> 1 — prior run documented it (DOC_UPDATED verdict)
+PRESEEDED_N=0; PRIOR_DOC_N=0   # scalars: ${#empty_assoc[@]} trips set -u on bash 5.2
 CUR_TREE=""
 
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -119,6 +128,68 @@ requeue_failed() { # print full SHAs of commits recorded as failed on a previous
   done < <(jq -r '.failures[]?' "$PROGRESS" 2>/dev/null)
 }
 
+# ---- preseeded SKIP knowledge (fresh-workspace reruns) ----
+# A NO_DOC verdict is a pure function of the commit (diff + tree), so verdicts from a
+# previous run of the same project can be replayed for free — no agent call is spent
+# re-deciding them. DOC_UPDATED verdicts canNOT be reused: the docs map is rebuilt
+# from scratch, so those commits must be re-documented.
+load_known_skips() {
+  local f full line n=0
+  if [ -n "$REUSE_VERDICTS" ]; then
+    [ -d "$REUSE_VERDICTS" ] || die "--reuse-verdicts: not a directory: $REUSE_VERDICTS"
+    REUSE_VERDICTS="$(cd "$REUSE_VERDICTS" && pwd)"
+    for f in "$REUSE_VERDICTS"/*.txt; do
+      [ -f "$f" ] || continue
+      case "$(head -1 "$f" 2>/dev/null || true)" in
+        VERDICT:\ NO_DOC*) ;;
+        *) continue;;
+      esac
+      full="$(g rev-parse --verify --quiet "$(basename "${f%.txt}")^{commit}" 2>/dev/null || true)"
+      [ -n "$full" ] || continue   # not a commit of this project: ignore
+      CACHED_SKIP["$full"]="$f"; n=$((n+1))
+    done
+    PRESEEDED_N=$((PRESEEDED_N + n))
+    echo "reuse-verdicts: $n reusable NO_DOC verdict(s) from $REUSE_VERDICTS"
+  fi
+  if [ -n "$SKIP_LIST" ]; then
+    [ -f "$SKIP_LIST" ] || die "--skip-list: not a file: $SKIP_LIST"
+    n=0
+    while IFS= read -r line || [ -n "$line" ]; do
+      line="${line//[[:space:]]/}"
+      case "$line" in ""|\#*) continue;; esac
+      full="$(g rev-parse --verify --quiet "$line^{commit}" 2>/dev/null || true)"
+      if [ -z "$full" ]; then echo "warn: skip-list: unknown commit '$line' ignored" >&2; continue; fi
+      [[ -v CACHED_SKIP["$full"] ]] && continue
+      CACHED_SKIP["$full"]="list"; n=$((n+1))
+    done < "$SKIP_LIST"
+    PRESEEDED_N=$((PRESEEDED_N + n))
+    echo "skip-list: $n commit(s) preseeded as SKIP"
+  fi
+  if [ "$DOC_HINTS" = 1 ]; then
+    [ -n "$REUSE_VERDICTS" ] || die "--doc-hints requires --reuse-verdicts DIR (the prior run's verdicts folder)"
+    # commits the prior run DOCUMENTED: eligible for a reconsideration round
+    # when the current run's agent says NO_DOC (--doc-hints)
+    local j n=0
+    for j in "$REUSE_VERDICTS"/*.json; do
+      [ -f "$j" ] || continue
+      [ "$(jq -r 'if .verdict == "DOC_UPDATED" then .verdict else empty end' "$j" 2>/dev/null)" = "DOC_UPDATED" ] || continue
+      full="$(g rev-parse --verify --quiet "$(basename "${j%.json}")^{commit}" 2>/dev/null || true)"
+      [ -n "$full" ] || continue
+      PRIOR_DOC["$full"]=1; n=$((n+1))
+    done
+    PRIOR_DOC_N=$n
+    # the prior run's docs map lives in the workspace the verdicts came from:
+    # <workspace>/<pipeline>/verdicts -> <workspace>/<docs_root>
+    PRIOR_PIPELINE="$(cd "$REUSE_VERDICTS/.." && pwd)"
+    PRIOR_WORK="$(cd "$PRIOR_PIPELINE/.." && pwd)"
+    PRIOR_DOCS_REL="$(jq -r '.docs_root // empty' "$PRIOR_PIPELINE/config.json" 2>/dev/null || true)"
+    PRIOR_DOCS_REL="${PRIOR_DOCS_REL:-agent/project}"
+    if [[ "$PRIOR_DOCS_REL" == /* ]]; then PRIOR_DOCS="$PRIOR_DOCS_REL"; else PRIOR_DOCS="$PRIOR_WORK/$PRIOR_DOCS_REL"; fi
+    [ -d "$PRIOR_DOCS" ] || die "--doc-hints: prior docs map not found at $PRIOR_DOCS (derived from the verdicts dir: keep the prior workspace intact)"
+    echo "doc-hints: $n prior DOC_UPDATED commit(s) reconsiderable; prior docs at $PRIOR_DOCS"
+  fi
+}
+
 # ---- auto-commit helpers ----
 commit_docs() { # <short> <subject>
   [ "$AUTO_COMMIT" = true ] || return 0
@@ -183,6 +254,24 @@ run_one() { # <sha>
   local sha="$1" short subject path args verdict rc kind extra="" parent=""
   short="${SHORT[$sha]}"; subject="${SUBJ[$sha]}"
 
+  if [[ -v CACHED_SKIP["$sha"] ]]; then
+    # preseeded NO_DOC (from --reuse-verdicts or --skip-list): replay it, no agent call
+    local src="${CACHED_SKIP[$sha]}"
+    echo "[$short] SKIP (preseeded)  $subject"
+    if [[ "$src" != list ]]; then
+      # copy the old verdict artifacts for traceability (skip if same verdicts dir)
+      if [ "$(cd "$(dirname "$src")" && pwd)" != "$VERDICTS" ]; then
+        cp -f "$src" "$VERDICTS/$sha.txt"
+        [ -f "${src%.txt}.json" ] && cp -f "${src%.txt}.json" "$VERDICTS/$sha.json"
+      fi
+    else
+      printf 'VERDICT: NO_DOC(skip-list)\n' > "$VERDICTS/$sha.txt"
+    fi
+    sync_set_baseline "$sha"
+    save_progress --arg b "$sha" '.processed += [$b] | .skipped += 1'
+    return 0
+  fi
+
   if [ -n "$SKIP_REGEX" ] && [[ $subject =~ $SKIP_REGEX ]]; then
     echo "[$short] SKIP (regex)  $subject"
     printf 'VERDICT: NO_DOC(regex)\n' > "$VERDICTS/$sha.txt"
@@ -198,6 +287,10 @@ run_one() { # <sha>
             --docs-root "$DOCS_ROOT" --docs-root-rel "$DOCS_ROOT_REL"
             --verdicts-dir "$VERDICTS")
   [ "${CLASSIFY_ONLY:-0}" = 1 ] && ag+=(--classify-only)
+  if [ "$DOC_HINTS" = 1 ] && [[ -v PRIOR_DOC["$sha"] ]]; then
+    # prior run documented this commit: enable the NO_DOC reconsideration round
+    ag+=(--prior-verdict "$REUSE_VERDICTS/$sha.json" --prior-docs "$PRIOR_DOCS")
+  fi
   local model="${OVERRIDE_MODEL:-$CFG_MODEL}"; [ -n "$model" ] && ag+=(--model "$model")
 
   echo "[$short] PROCESS       $subject"
@@ -250,6 +343,21 @@ Usage: run.sh [options]
   --limit N       Process at most N commits this run.
   --range X       Process commits in range X (e.g. A..B). Overrides baseline.
   --sha S         Process a single commit (ignores baseline).
+  --reuse-verdicts DIR
+                  Replay NO_DOC verdicts from a previous run's verdicts directory:
+                  those commits are skipped without any agent calls (useful when
+                  re-running the same project from scratch). DOC_UPDATED verdicts
+                  are not reused — the docs map is rebuilt from scratch.
+  --skip-list FILE
+                  Additionally treat the commits listed in FILE (one hash per
+                  line, '#' comments, short or full SHAs) as NO_DOC without
+                  agent calls.
+  --doc-hints     Requires --reuse-verdicts. When the agent finishes NO_DOC for
+                  a commit the prior run documented (DOC_UPDATED), feed the
+                  prior run's actual doc CONTENT back into the same session and
+                  ask for one reconsideration round before accepting NO_DOC.
+                  Helps borderline DOCUMENT/SKIP decisions converge across
+                  reruns instead of flip-flopping with sampling noise.
   --in-place      Checkout each commit in the source clone instead of a worktree.
   --stop-on-fail  Halt on the first failed commit (default: record and continue).
   --no-commit     Do not git-commit doc changes this run (overrides config auto_commit).
@@ -259,16 +367,20 @@ EOF
 
 DO_LIST=0; RESET_BASE=0; LIMIT=0; RANGE=""; SINGLE=""; OVERRIDE_MODEL=""
 STOP_ON_FAIL=0; CLASSIFY_ONLY=0; VALIDATE=0; VALIDATE_REF=""
+REUSE_VERDICTS=""; SKIP_LIST=""; DOC_HINTS=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --list) DO_LIST=1;;
     --dry-run) CLASSIFY_ONLY=1;;
     --validate) VALIDATE=1
-                if [ $# -ge 2 ] && [[ "$2" != -* ]]; then VALIDATE_REF="$2"; shift; fi;;
+                 if [ $# -ge 2 ] && [[ "$2" != -* ]]; then VALIDATE_REF="$2"; shift; fi;;
     --reset-baseline) RESET_BASE=1;;
     --limit) LIMIT="${2:?--limit needs N}"; shift;;
     --range) RANGE="${2:?--range needs A..B}"; shift;;
     --sha) SINGLE="${2:?--sha needs SHA}"; shift;;
+    --reuse-verdicts) REUSE_VERDICTS="${2:?--reuse-verdicts needs DIR}"; shift;;
+    --skip-list) SKIP_LIST="${2:?--skip-list needs FILE}"; shift;;
+    --doc-hints) DOC_HINTS=1;;
     --in-place) USE_WORKTREE=false;;
     --stop-on-fail) STOP_ON_FAIL=1;;
     --no-commit) AUTO_COMMIT=false;;
@@ -305,6 +417,8 @@ fi
 # fail fast on an obviously missing model config (env VIBE_MODEL overrides)
 [ -n "${OVERRIDE_MODEL:-}" ] || [ -n "$CFG_MODEL" ] || \
   die "no model configured: set llm.model in config.json or export VIBE_MODEL"
+
+load_known_skips
 
 # ---- commit list ----
 rl=(--reverse)
@@ -348,22 +462,24 @@ load_meta "${SHAS[@]}"
 
 # ---- list mode ----
 if [ "$DO_LIST" = 1 ]; then
-  p=0; s=0; d=0
+  p=0; s=0; d=0; ps=0
   printf '%-12s %-8s %s\n' SHORT DECISION SUBJECT
   for sha in "${SHAS[@]}"; do
     subj="${SUBJ[$sha]:-?}"; short="${SHORT[$sha]:-??????????}"
     if [[ -v PROC["$sha"] ]]; then dec="DONE"; d=$((d+1))
+    elif [[ -v CACHED_SKIP["$sha"] ]]; then dec="SKIP*"; ps=$((ps+1))
     elif [ -n "$SKIP_REGEX" ] && [[ $subj =~ $SKIP_REGEX ]]; then dec="SKIP"; s=$((s+1))
     else dec="PROCESS"; p=$((p+1)); fi
     printf '%-12s %-8s %s\n' "$short" "$dec" "$subj"
   done
-  echo "---"; echo "range=${#SHAS[@]} PROCESS=$p SKIP=$s DONE=$d"
+  echo "---"; echo "range=${#SHAS[@]} PROCESS=$p SKIP=$s DONE=$d preseeded=$ps"
+  [ "$ps" -gt 0 ] && echo "SKIP* = preseeded NO_DOC (--reuse-verdicts / --skip-list)"
   exit 0
 fi
 
 {
   echo "=== vibe-walk started $(date -Iseconds) ==="
-  echo "project=$PROJECT source=$SOURCE_REL branch=$BRANCH commits=${#SHAS[@]} worktree=$USE_WORKTREE classify=$CLASSIFY_ONLY commit=$AUTO_COMMIT model=${OVERRIDE_MODEL:-$CFG_MODEL}"
+  echo "project=$PROJECT source=$SOURCE_REL branch=$BRANCH commits=${#SHAS[@]} worktree=$USE_WORKTREE classify=$CLASSIFY_ONLY commit=$AUTO_COMMIT model=${OVERRIDE_MODEL:-$CFG_MODEL} preseeded=$PRESEEDED_N doc_hints=$([ "$DOC_HINTS" = 1 ] && echo "$PRIOR_DOC_N" || echo 0)"
 } | tee -a "$WALK_LOG"
 
 count=0; last_short=""
