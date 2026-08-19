@@ -87,6 +87,31 @@ git -C someproject pull        # sync new changes
 
 `--reset-baseline` starts over from the project's first commit.
 
+## Re-running from scratch (reusing SKIP verdicts)
+
+A NO_DOC verdict is a pure function of the commit (diff + tree), so it can be
+replayed across runs. Save the old run's `vibedocing/verdicts/` folder and pass it
+to the fresh run — those commits are skipped with **zero agent calls**:
+
+```bash
+cp -r mywork/vibedocing/verdicts ~/verdicts-someproject-run1   # keep the old verdicts
+# ... new workspace, bootstrap ...
+./vibedocing/run.sh --reuse-verdicts ~/verdicts-someproject-run1
+```
+
+DOC_UPDATED commits are re-processed normally (the docs map is rebuilt from
+scratch). `--skip-list FILE` force-skips specific commits (one hash per line,
+`#` comments) — handy to override commits a previous run documented.
+
+Borderline DOCUMENT/SKIP decisions can flip between runs (LLM sampling noise,
+different docs-map state). `--doc-hints` (with `--reuse-verdicts`) covers the
+expensive direction: when the agent finishes NO_DOC for a commit the prior run
+*documented*, it gets one extra round **with the prior run's actual doc content
+attached** and must explicitly confirm or overturn its NO_DOC. The old docs are
+read from the prior workspace (`<verdicts>/../../<docs_root>`); the round is
+visible in the verdict JSON (`"reconsidered": true`) and the transcript
+(`source: "reconsider"`).
+
 ## Common options
 
 ```
@@ -96,6 +121,10 @@ git -C someproject pull        # sync new changes
 --limit N            process at most N commits
 --range A..B         process a specific range
 --sha S              process a single commit
+--reuse-verdicts D   replay NO_DOC verdicts from a previous run's verdicts dir
+--skip-list F        force-skip commits listed in F (one hash per line)
+--doc-hints          on NO_DOC for a commit the prior run documented, re-ask the
+                    agent once with the prior run's actual docs attached
 --in-place           checkout in the source clone instead of a worktree
 --no-commit          don't git-commit this run
 --stop-on-fail       halt on the first failed commit

@@ -40,11 +40,30 @@ OpenAI-compat endpoint `https://api.anthropic.com/v1`.
 Other `llm` knobs: `max_steps` (tool-call rounds per commit, default 24),
 `max_steps_initial` (step budget for the root/initial-snapshot commit, default 0 =
 keep `max_steps`; 48 is a good value for projects born as one giant commit),
-`request_timeout_seconds` (per HTTP request, default 180), `retries` (default 5;
-exponential backoff, honors `Retry-After`), `temperature` and `max_tokens` (omitted
-when null/0 — some strict gateways/models reject explicit values), `log_transcript`
-(default true — write the full LLM interaction log per commit, see
-Troubleshooting below).
+`max_steps_cap` (default 48 — doc-heavy commits get `+1` step per 8 changed files
+on top of `max_steps`, capped here: a 34-file move commit needs more write rounds
+than a one-liner), `request_timeout_seconds` (per HTTP request, default 180),
+`retries` (default 5; exponential backoff, honors `Retry-After`), `temperature`
+and `max_tokens` (omitted when null/0 — some strict gateways/models reject
+explicit values), `log_transcript` (default true — write the full LLM interaction
+log per commit, see Troubleshooting below).
+
+Built-in loop guardrails (observed on weak models, fernflower runs): exact
+duplicate tool calls are refused instead of executed (loops burned 5-7 steps on
+one repeated `git show`); the last 5 steps carry deadline pressure and a hard
+"call finish NOW" message; a budget that runs out mid-`write_doc` is extended
+(up to 2×6 steps); a budget that runs out with docs already written gets ONE
+finish-only grace round - and if even that passes without a finish call, the
+verdict is synthesized from the docs actually written (still validated).
+`write_doc` supports `{"append": true}` for docs too long for one call, and a
+tool call whose JSON was cut off by the gateway's output token limit (qwen on
+neuraldeep caps at 8000 tokens without setting `finish_reason`) gets a
+dedicated split-and-append hint instead of a bare parse error. `write_doc`
+also lints cited repo paths at write time and warns immediately, enforces
+per-directory sequential numbering for new numbered docs (a refusal names the
+exact expected path - weak models otherwise continue another directory's
+counter and leave permanent gaps like functions/ 01-09 then 22-25), and
+supports `{"delete": true}` to remove duplicate/obsolete docs during repair.
 
 ## Qwen models (thinking mode)
 Qwen3.x reasoning models work best in agent loops with **thinking ON**: community
@@ -113,6 +132,8 @@ After every DOC_UPDATED verdict the docs map is validated mechanically (config
 
 ## Performance / cost
 - Tune `commit_skip_regex` with `--list` first — a good filter avoids most agent calls.
+- Re-running a project from scratch? `--reuse-verdicts` replays previous NO_DOC
+  verdicts for free (see "Re-running from scratch").
 - `--dry-run` validates classification cheaply before real writes.
 - `--limit N` bounds a run; combine with automatic resume for overnight batches.
 - Each agent call is a fresh short-lived process — there is no server to keep warm.
@@ -124,6 +145,35 @@ After every DOC_UPDATED verdict the docs map is validated mechanically (config
 ## Restart after sync
 The committed `agent/project/.vibedocing.json` holds the baseline. After `git pull` in the
 project, `run.sh` documents only `baseline..HEAD`. `--reset-baseline` restarts from zero.
+
+## Re-running from scratch (verdict reuse)
+`--reuse-verdicts DIR` replays NO_DOC verdicts from a previous run's `verdicts/`
+directory: matching commits are marked SKIP without any agent calls, and their
+`<sha>.txt`/`<sha>.json` artifacts are copied into the new run's verdicts dir for
+traceability. Commits that don't exist in the source repo are ignored, so the same
+folder can be shared across projects safely. DOC_UPDATED verdicts are never reused —
+those commits must be re-documented because the docs map is rebuilt from scratch.
+`--skip-list FILE` takes a plain list of hashes (one per line, `#` comments, short or
+full SHAs) and force-skips them; it also lets you override commits a previous run
+marked DOC_UPDATED. Preview with `--list` (they appear as `SKIP*`). Caveat: skip
+decisions can depend on `project-conventions.md` and the model — don't reuse verdicts
+after editing conventions and expect identical coverage.
+
+### --doc-hints (reconsideration round)
+Borderline commits legitimately flip between runs (sampling noise + the docs-map state
+differs), and a missed DOC_UPDATED is much costlier than a missed SKIP. With
+`--reuse-verdicts DIR --doc-hints`, commits the prior run documented get a second
+chance: if the current agent finishes NO_DOC, the loop does NOT accept it yet — it
+injects one extra user message containing the *content* of the prior run's docs
+(capped: 6 files, 16 KB each, 48 KB total) and the prior finish reason, and the agent
+must finish again: write the docs adapted to the current map (DOC_UPDATED) or reaffirm
+NO_DOC with a justification. The round extends the step budget by 8, happens at most
+once per commit, and is recorded in the verdict JSON (`"reconsidered": true`) and the
+transcript (`"source": "reconsider"`). The prior docs are located automatically at
+`<verdicts-dir>/../../<docs_root from the prior config.json>` — keep the prior
+workspace intact, or pass a verdicts folder that still sits inside it. In
+`--dry-run` mode the reconsideration asks for the verdict only (writes stay
+disabled).
 
 ## Auto-commit
 When `auto_commit` is true (default) and not `--dry-run`/`--no-commit`, each documented
@@ -185,9 +235,9 @@ PYTHONPATH=vibedocing python3 -m vibe_agent --config vibedocing/config.json \
     pipeline already compensates for the most common weak-model traits: docs-root
     prefixes on read paths are auto-stripped, repair rounds extend the step
     budget, text-only/empty replies get an immediate user nudge back to tools,
-    and a deadline note pushes the model to `finish` before the limit. If the
-    budget still runs out while docs are being actively written (giant
-    path-hygiene commits), it is extended once so the pass completes.
+    exact duplicate calls are refused, the deadline is pushed hard in the last
+    5 steps, and a budget that runs out mid-write is extended (up to 2×6 steps)
+    with a final finish-only grace round when docs were written.
   Note: a genuinely *exceeded* context window surfaces differently — as
   `ERROR llm: HTTP 400 … context length …`, not as max_steps.
 - **worktree add failed** — rerun (worktrees are force-removed first); or
