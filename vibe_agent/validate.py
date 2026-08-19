@@ -101,11 +101,19 @@ def check_naming(docs_root, errors, warnings):
                               % (directory, name))
                 continue
             number = match.group(1)
-            numbers.setdefault(number, []).append(name)
+            if len(number) < 2:
+                errors.append(
+                    "naming: %s/%s uses an unpadded number - the fixed layout "
+                    "numbers docs with TWO digits. Re-save the doc as "
+                    "'%s/%02d-%s' (a single write_doc to that path replaces "
+                    "the unpadded file automatically)"
+                    % (directory, name, directory, int(number),
+                       name[match.end():]))
+            numbers.setdefault(int(number), []).append(name)
         for number, names in sorted(numbers.items()):
             if len(names) > 1:
                 errors.append(
-                    "naming: duplicate number %s in %s/: %s. Keep ONE of these "
+                    "naming: duplicate number %02d in %s/: %s. Keep ONE of these "
                     "files (merge the content if both have value) and DELETE the "
                     "others with write_doc({\"path\": \"%s/<file>\", "
                     "\"delete\": true}). Do NOT create yet another numbered file "

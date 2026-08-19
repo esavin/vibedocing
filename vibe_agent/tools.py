@@ -51,6 +51,8 @@ LAYOUT_ERROR = (
     "'update-documents.md' - paths are relative to the docs root itself "
     "(no 'agent/project/' prefix, no nested or source-mirroring folders). Got: '%s'"
 )
+NUMBERING_HINT = ("<number> is always TWO digits with a hyphen: 01, 02, ... 10, 11 - "
+                  "e.g. functions/01-cli.md")
 
 
 def _truncate(text, limit):
@@ -184,7 +186,9 @@ class ToolSet(object):
                         "root) and must follow the fixed layout: "
                         "functions/<number>-<name>.md, "
                         "design/<number>-<name>.md, PROJECT.md, "
-                        "project-conventions.md, or update-documents.md. A NEW "
+                        "project-conventions.md, or update-documents.md "
+                        "(<number> = two digits: 01, 02, ... - unpadded names "
+                        "are normalized automatically). A NEW "
                         "numbered doc MUST take the lowest free number in ITS "
                         "directory (checked at write time - the error names "
                         "the exact expected path); never continue another "
@@ -520,50 +524,75 @@ class ToolSet(object):
         rel = os.path.relpath(target, self.docs_root).replace(os.sep, "/")
         fixed = self._fix_docs_layout(rel, self.docs_root)
         if fixed is None:
-            return {"ok": False, "error": LAYOUT_ERROR % rel}
+            extra = (" " + NUMBERING_HINT
+                     if rel.split("/", 1)[0].lower() in DOCS_TOP_DIRS else "")
+            return {"ok": False, "error": LAYOUT_ERROR % rel + extra}
         note = None
         if fixed != rel:
             note = "path normalized from '%s'" % rel
             target = os.path.join(self.docs_root, *fixed.split("/"))
             rel = fixed
-        # per-directory sequential numbering, enforced at write time for NEW
-        # files: a weak model continues whichever counter it saw last (design/
-        # numbering leaked into functions/ as 01-09 then 22-25, leaving 10-21
-        # free forever). Overwriting an EXISTING path is always allowed.
-        if ("/" in rel and not os.path.exists(target)
-                and args.get("delete") is not True):
+        # canonical two-digit numbering, enforced at write time: an unpadded
+        # single-digit name (functions/1-x.md) is retargeted to the padded
+        # spelling (functions/01-x.md), and a pre-existing unpadded twin of
+        # the same doc is replaced after the write - the map never keeps both.
+        unpadded_twin = None
+        if "/" in rel and args.get("delete") is not True:
             directory, _, fname = rel.partition("/")
             match = _NUMBER_RE.match(fname)
             if match:
-                siblings = {}
-                dpath = os.path.join(self.docs_root, directory)
-                if os.path.isdir(dpath):
-                    for name in sorted(os.listdir(dpath)):
-                        if name.startswith(".") or not name.lower().endswith(".md"):
-                            continue
-                        m2 = _NUMBER_RE.match(name)
-                        if m2:
-                            siblings.setdefault(int(m2.group(1)), name)
-                lowest = 1
-                while lowest in siblings:
-                    lowest += 1
                 number = int(match.group(1))
-                if number in siblings:
+                if number < 1:
                     return {"ok": False,
-                            "error": "numbering: number %s is already taken by "
-                                     "%s/%s - do NOT create a second doc with "
-                                     "it; update THAT file instead (or merge "
-                                     "and delete the redundant one)"
-                                     % (match.group(1), directory,
-                                        siblings[number])}
-                if number > lowest:
-                    new_rel = "%s/%02d-%s" % (directory, lowest,
-                                              fname[match.end():])
-                    return {"ok": False,
-                            "error": "numbering: %s has free numbers below %s - "
-                                     "write this doc as '%s' instead "
-                                     "(per-directory sequential numbering)"
-                                     % (directory, match.group(1), new_rel)}
+                            "error": "numbering: doc numbers start at 01"}
+                rest = fname[match.end():]
+                if len(match.group(1)) < 2:
+                    orig_rel = rel
+                    rel = "%s/%02d-%s" % (directory, number, rest)
+                    unpadded_twin = target
+                    target = os.path.join(self.docs_root, *rel.split("/"))
+                    note = ("%s; numbering normalized from '%s'"
+                            % (note, orig_rel)) if note else \
+                           ("numbering normalized from '%s'" % orig_rel)
+                # per-directory sequential numbering, enforced at write time
+                # for NEW files: a weak model continues whichever counter it
+                # saw last (design/ numbering leaked into functions/ as 01-09
+                # then 22-25, leaving 10-21 free forever). Overwriting an
+                # EXISTING path is always allowed.
+                if not os.path.exists(target):
+                    siblings = {}
+                    dpath = os.path.join(self.docs_root, directory)
+                    if os.path.isdir(dpath):
+                        for name in sorted(os.listdir(dpath)):
+                            if name.startswith(".") or not name.lower().endswith(".md"):
+                                continue
+                            m2 = _NUMBER_RE.match(name)
+                            if m2:
+                                siblings.setdefault(int(m2.group(1)), name)
+                    lowest = 1
+                    while lowest in siblings:
+                        lowest += 1
+                    if number in siblings:
+                        if siblings[number] == "%d-%s" % (number, rest):
+                            # the unpadded twin of THIS doc: the write below
+                            # replaces it under the canonical padded name
+                            unpadded_twin = os.path.join(dpath, siblings[number])
+                        else:
+                            return {"ok": False,
+                                    "error": "numbering: number %02d is already "
+                                             "taken by %s/%s - do NOT create a "
+                                             "second doc with it; update THAT "
+                                             "file instead (or merge and delete "
+                                             "the redundant one)"
+                                             % (number, directory,
+                                                siblings[number])}
+                    if number > lowest:
+                        new_rel = "%s/%02d-%s" % (directory, lowest, rest)
+                        return {"ok": False,
+                                "error": "numbering: %s has free numbers below "
+                                         "%02d - write this doc as '%s' instead "
+                                         "(per-directory sequential numbering)"
+                                         % (directory, number, new_rel)}
         if args.get("delete") is True:
             # deleting a doc is allowed only inside functions/ or design/ and
             # only for merging duplicates/obsoletes - never the fixed files
@@ -602,6 +631,15 @@ class ToolSet(object):
             self.written_files.append(rel)
         result = {"ok": True, "written": len(content.encode("utf-8")),
                   "path": rel}
+        if unpadded_twin and os.path.isfile(unpadded_twin) \
+                and os.path.abspath(unpadded_twin) != os.path.abspath(target):
+            # the canonical write above replaced this doc's unpadded spelling
+            try:
+                os.remove(unpadded_twin)
+                result["replaced"] = os.path.relpath(
+                    unpadded_twin, self.docs_root).replace(os.sep, "/")
+            except OSError:
+                pass
         if append:
             result["appended"] = True
         if note:

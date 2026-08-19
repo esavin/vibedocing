@@ -111,6 +111,11 @@ pointing at pre-rename paths is useless. A repo-wide path-existence check on eve
 doc pass additionally catches stale paths introduced by earlier skipped commits.
 
 ## Validation (quality gate)
+- `naming` also enforces the canonical two-digit numbering: an unpadded
+  `functions/1-x.md` is an error, and `1-x.md`/`01-x.md` count as duplicate
+  numbers. `write_doc` normalizes unpadded names automatically (a write to
+  `functions/1-x.md` lands as `functions/01-x.md` and replaces the unpadded
+  twin), so the repair is a single re-save under the padded path.
 After every DOC_UPDATED verdict the docs map is validated mechanically (config
 `validation`):
 - checks: fixed layout; `<number>-<name>.md` naming with unique numbers per

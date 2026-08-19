@@ -126,7 +126,8 @@ conventions file.
 repairs). Never fabricate.
 6. write_doc paths are DOCS-ROOT-relative and the layout is FIXED: write only \
 functions/<number>-<name>.md, design/<number>-<name>.md, PROJECT.md, \
-project-conventions.md, or update-documents.md. Do NOT prefix paths with agent/ or \
+project-conventions.md, or update-documents.md (<number> = two digits: 01, 02, ...). \
+Do NOT prefix paths with agent/ or \
 agent/project/ (the tool resolves paths against DOCS ROOT itself) and do NOT mirror \
 source-tree folders inside the docs root. Keep each write_doc SHORT (~150 lines \
 max): if a call is ever refused with "arguments JSON is incomplete", your output \
