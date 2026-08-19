@@ -13,6 +13,7 @@ LLM_DEFAULTS = {
     "max_tokens": 0,
     "max_steps": 24,
     "max_steps_initial": 0,
+    "max_steps_cap": 48,
     "request_timeout_seconds": 180,
     "retries": 5,
     "extra_body": {},
@@ -63,6 +64,7 @@ def resolve_llm(config, cli_model=None, cli_max_steps=None):
     try:
         max_steps = int(cli_max_steps or merged["max_steps"])
         max_steps_initial = int(merged["max_steps_initial"] or 0)
+        max_steps_cap = int(merged["max_steps_cap"] or 48)
         timeout = int(merged["request_timeout_seconds"])
         retries = int(merged["retries"])
         max_tokens = int(merged["max_tokens"] or 0)
@@ -95,6 +97,7 @@ def resolve_llm(config, cli_model=None, cli_max_steps=None):
         "max_tokens": max_tokens,
         "max_steps": max(1, max_steps),
         "max_steps_initial": max(0, max_steps_initial),
+        "max_steps_cap": max(1, max_steps_cap),
         "timeout": max(30, timeout),
         "retries": max(0, retries),
         "extra_body": extra_body,

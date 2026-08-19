@@ -63,7 +63,9 @@ path renamed/deleted by this commit). If it reports problems you will get one re
 round: fix ONLY the listed problems with write_doc, then IMMEDIATELY call finish \
 again - do not re-read files, re-verify, or explore anything else first. Also: \
 read_file/list_dir paths are absolute or relative to the WORKTREE or DOCS ROOT \
-themselves - never prefix them with a workspace folder like agent/project/.
+themselves - never prefix them with a workspace folder like agent/project/. Repeated \
+exploration near the step limit is cut off: watch the step counter in tool results \
+and call finish in time.
 
 # Classification rules
 DOCUMENT when the commit:
@@ -109,7 +111,9 @@ first: what the project is, how to run/use it, how the top-level modules fit tog
 1. Read PROJECT.md and the relevant functions/*.md and design/*.md first; decide NEW \
 vs UPDATE. Never duplicate an existing function doc. For new files reuse the lowest \
 free <number>- prefix in the name; never create a second doc with a number already \
-used in that directory.
+used in that directory - and never create a second doc for a TOPIC that already has \
+one (update the existing file instead; merge and delete true duplicates with \
+write_doc {"path": ..., "delete": true}).
 2. Create/update function and/or design docs using the templates below. Cite source \
 files as repository-root-relative paths, exactly as they exist in the worktree.
 3. Update PROJECT.md navigation for any new doc; refresh the module/package map if a \
@@ -123,7 +127,10 @@ repairs). Never fabricate.
 functions/<number>-<name>.md, design/<number>-<name>.md, PROJECT.md, \
 project-conventions.md, or update-documents.md. Do NOT prefix paths with agent/ or \
 agent/project/ (the tool resolves paths against DOCS ROOT itself) and do NOT mirror \
-source-tree folders inside the docs root.
+source-tree folders inside the docs root. Keep each write_doc SHORT (~150 lines \
+max): if a call is ever refused with "arguments JSON is incomplete", your output \
+was cut by the token limit - write the first half, then continue the SAME file \
+with write_doc {"path": ..., "append": true, "content": ...} parts.
 
 ## Function doc template (functions/<number>-<name>.md)
 # <Function Name> Function
@@ -226,11 +233,27 @@ def parent_sha(worktree, sha):
     return _git_ok(worktree, ["rev-parse", "--verify", "--quiet", sha + "^"]).strip()
 
 
-def name_status(worktree, parent, sha, max_am=150, max_rd=500):
+def _grouped_pairs(entries, max_groups=60):
+    """[(old_dir, new_dir), ...] -> [((old_dir, new_dir), count), ...] sorted
+    by count desc, capped."""
+    groups = {}
+    for key in entries:
+        groups[key] = groups.get(key, 0) + 1
+    ordered = sorted(groups.items(), key=lambda kv: (-kv[1], kv[0]))
+    return ordered[:max_groups], max(0, len(ordered) - max_groups)
+
+
+def name_status(worktree, parent, sha, max_am=150, max_rd=500, group_after=100):
     """Rename-aware `git diff --name-status -M parent sha`, R/D entries first.
 
-    Returns (text, old_paths) where old_paths are the pre-rename / deleted paths
-    (what existing docs may still cite).
+    Returns (text, old_paths, changed) where old_paths are the pre-rename /
+    deleted paths (what existing docs may still cite) and changed is the total
+    number of touched files (the caller sizes the agent step budget from it).
+
+    Giant moves (whole-subtree renames of hundreds of files) are GROUPED by
+    directory pair: a 900-line flat list is noise the model skips, while
+    "test/x/ (112 files) -> testData/roundTrip/x/" is a pattern it can apply
+    to every citation.
     """
     raw = _git(worktree, ["diff", "--name-status", "-M", parent, sha])
     renames, deletes, others = [], [], []
@@ -242,30 +265,56 @@ def name_status(worktree, parent, sha, max_am=150, max_rd=500):
         status = parts[0]
         if status.startswith("R") and len(parts) >= 3:
             old, new = parts[1], parts[2]
-            renames.append("R  %s  ->  %s" % (old, new))
+            renames.append((old, new))
             old_paths.append(old)
         elif status.startswith("D"):
-            deletes.append("D  %s" % parts[1])
+            deletes.append(parts[1])
             old_paths.append(parts[1])
         else:
-            others.append("%s  %s" % (status, parts[-1]))
-    if not (renames or deletes or others):
-        return "", old_paths
+            others.append((status, parts[-1]))
+    changed = len(renames) + len(deletes) + len(others)
+    if changed == 0:
+        return "", old_paths, 0
     lines = []
+    grouped = len(renames) + len(deletes) > group_after
     if renames:
-        lines.append("renames (old -> new):")
-        lines.extend("  " + r for r in renames[:max_rd])
+        if grouped:
+            lines.append("renames (old directory -> new directory, GROUPED - "
+                         "%d renamed files total):" % len(renames))
+            entries = [(os.path.dirname(o) or ".", os.path.dirname(n) or ".")
+                       for o, n in renames]
+            pairs, extra = _grouped_pairs(entries)
+            lines.extend("  R  %s/*  ->  %s/*  (%d files)" % (od, nd, count)
+                         for (od, nd), count in pairs)
+            if extra:
+                lines.append("  ... [+%d more directory groups - enumerate "
+                             "with `git diff --name-status -M %s`]"
+                             % (extra, sha[:10]))
+        else:
+            lines.append("renames (old -> new):")
+            lines.extend("  R  %s  ->  %s" % (o, n) for o, n in renames[:max_rd])
     if deletes:
-        lines.append("deletions:")
-        lines.extend("  " + d for d in deletes[:max_rd])
+        if grouped:
+            lines.append("deletions (GROUPED - %d deleted files total):"
+                         % len(deletes))
+            entries = [(os.path.dirname(d) or ".", ".") for d in deletes]
+            pairs, extra = _grouped_pairs(entries)
+            lines.extend("  D  %s/*  (%d files)" % (od, count)
+                         for (od, _), count in pairs)
+            if extra:
+                lines.append("  ... [+%d more directory groups]"
+                             % extra)
+        else:
+            lines.append("deletions:")
+            lines.extend("  D  %s" % d for d in deletes[:max_rd])
     if others:
         lines.append("added/modified:")
         shown = others[:max_am]
-        lines.extend("  " + o for o in shown)
+        lines.extend("  %s  %s" % (s, p) for s, p in shown)
         if len(others) > max_am:
             lines.append("  ... [+%d more A/M entries — use `git show --stat %s`]"
                          % (len(others) - max_am, sha[:10]))
-    return "\n".join(lines), old_paths
+    return "\n".join(lines), old_paths, changed
 
 
 def _tree_digest(worktree, sha, max_dirs=30, max_files=20000):
@@ -332,14 +381,67 @@ def stale_doc_references(docs_root, old_paths, max_report=30, max_docs=8):
     return "\n".join(entries) + more
 
 
+def _compact_ranges(numbers):
+    """[1, 2, 3, 7, 9, 10] -> '01-03, 07, 09-10' (zero-padded to 2 digits)."""
+    ranges = []
+    start = prev = numbers[0]
+    for n in numbers[1:]:
+        if n == prev + 1:
+            prev = n
+            continue
+        ranges.append((start, prev))
+        start = prev = n
+    ranges.append((start, prev))
+    out = []
+    for a, b in ranges:
+        if a == b:
+            out.append("%02d" % a)
+        else:
+            out.append("%02d-%02d" % (a, b))
+    return ", ".join(out)
+
+
+def docs_numbering(docs_root):
+    """Per-directory numbering state with the exact next free number, so the
+    model never guesses (fernflower runs continued design/'s counter into
+    functions/ - 01-09 then 22-25 - leaving 10-21 free forever)."""
+    from vibe_agent.validate import _NUMBER_RE, DOCS_TOP_DIRS
+    lines = []
+    for directory in sorted(DOCS_TOP_DIRS):
+        path = os.path.join(docs_root, directory)
+        if not os.path.isdir(path):
+            continue
+        used = []
+        for name in sorted(os.listdir(path)):
+            if name.startswith(".") or not name.lower().endswith(".md"):
+                continue
+            match = _NUMBER_RE.match(name)
+            if match:
+                used.append(int(match.group(1)))
+        if not used:
+            continue
+        used.sort()
+        lowest = 1
+        while lowest in used:
+            lowest += 1
+        ranges = _compact_ranges(sorted(set(used)))
+        lines.append(
+            "- %s/: numbers in use %s - the LOWEST FREE number for a NEW doc "
+            "here is %02d. Number docs per-directory: NEVER continue another "
+            "directory's numbering." % (directory, ranges, lowest))
+    return "\n".join(lines)
+
+
 def build_first_user(sha, worktree, docs_root, mode, today, conventions):
     """Build the first user message. Returns (text, info) where info carries
-    {"is_root": bool, "old_paths": [...]} for the validation stage."""
+    {"is_root": bool, "old_paths": [...], "changed": int} for the caller
+    (validation old-paths and adaptive step budgeting)."""
     subject = _git(worktree, ["log", "-1", "--format=%s", sha]).strip()
     message = _git(worktree, ["log", "-1", "--format=%B", sha]).strip()
 
     root = is_root_commit(worktree, sha)
     old_paths = []
+    changed = 0
     sections = []
 
     if root:
@@ -356,7 +458,7 @@ def build_first_user(sha, worktree, docs_root, mode, today, conventions):
     else:
         parent = parent_sha(worktree, sha)
         if parent:
-            status_text, old_paths = name_status(worktree, parent, sha)
+            status_text, old_paths, changed = name_status(worktree, parent, sha)
             if status_text:
                 sections.append("NAME STATUS (git diff --name-status -M, "
                                 "renames/deletions first):\n%s" % _cap(status_text, 20000))
@@ -372,6 +474,13 @@ def build_first_user(sha, worktree, docs_root, mode, today, conventions):
                 "THIS commit — your mandatory repair worklist; also run search_docs "
                 "for each old path):\n%s" % stale
             )
+
+    numbering = docs_numbering(docs_root)
+    if numbering:
+        sections.append(
+            "DOCS NUMBERING (exact current state - use these numbers, do not "
+            "compute your own):\n%s" % numbering
+        )
 
     if not conventions:
         conventions = ("(missing - infer conservatively from the source tree and flag "
@@ -396,7 +505,8 @@ def build_first_user(sha, worktree, docs_root, mode, today, conventions):
         "",
         "Begin: inspect the commit, classify, act if warranted, then call finish.",
     ])
-    return "\n".join(parts), {"is_root": root, "old_paths": old_paths}
+    return "\n".join(parts), {"is_root": root, "old_paths": old_paths,
+                              "changed": changed}
 
 
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{4,40}$")

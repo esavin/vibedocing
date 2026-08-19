@@ -164,11 +164,13 @@ def main(argv=None):
     verdict = None
     old_paths = []
     root_commit = False
+    changed = 0
     try:
         first_user, info = build_first_user(args.sha, worktree, docs_root, mode,
                                             today, read_conventions(docs_root))
         old_paths = info["old_paths"]
         root_commit = info["is_root"]
+        changed = info.get("changed", 0)
     except InspectError as exc:
         verdict = {"verdict": "ERROR", "files": [], "reason":
                    "cannot-inspect-commit: %s" % exc, "steps": 0,
@@ -199,10 +201,17 @@ def main(argv=None):
 
     if verdict is None:
         max_steps = llm["max_steps"]
+        boost = 0
         if root_commit and llm["max_steps_initial"] > 0:
             max_steps = llm["max_steps_initial"]
-        log("model=%s endpoint=%s mode=%s root_commit=%s steps<=%d validation=%s/%d"
+        elif changed:
+            # doc-heavy commits (big moves touching many cited docs) need more
+            # tool rounds: +1 step per 8 changed files, capped at max_steps_cap
+            boost = min(max(0, llm["max_steps_cap"] - max_steps), changed // 8)
+            max_steps += boost
+        log("model=%s endpoint=%s mode=%s root_commit=%s steps<=%d%s validation=%s/%d"
             % (llm["model"], llm["base_url"], mode, root_commit, max_steps,
+               (" (+%d for %d changed files)" % (boost, changed)) if boost else "",
                val_mode, val_rounds))
         if transcript is not None:
             transcript.record({

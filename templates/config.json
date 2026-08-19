@@ -36,6 +36,7 @@
     "max_tokens": 0,
     "max_steps": 24,
     "max_steps_initial": 48,
+    "max_steps_cap": 48,
     "request_timeout_seconds": 180,
     "retries": 5,
     "extra_body": {},
