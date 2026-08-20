@@ -29,6 +29,7 @@ git clone <project-url> ./someproject
 
 # 4. point the agent at your model (any OpenAI-compatible endpoint)
 $EDITOR vibedocing/config.json        # llm.model, llm.base_url
+                                      # ~32k-context model? set limits.profile = "small"
 export VIBE_API_KEY=...               # or whatever llm.api_key_env names
 
 # 5. preview, then run
@@ -58,11 +59,17 @@ mywork/                         <- workspace (its own git repo)
 1. `run.sh` checks the commit out into a disposable git worktree (stateful replay).
 2. `python3 -m vibe_agent` — fresh session — injects the commit metadata, a
    rename-aware name-status (renames/deletions first), a precomputed list of docs
-   still citing paths renamed/deleted by this commit, and project conventions into a
-   compact system+user prompt, then classifies DOCUMENT vs SKIP from the actual diff
-   and the historical tree via six guarded tools (git/read_file/list_dir/search_docs/
-   write_doc/finish). Root commits (giant initial snapshots) get a dedicated mode:
-   a real tree digest instead of the diffstat and a bigger step budget.
+   still citing paths renamed/deleted by this commit, a one-line-per-doc overview
+   of the current docs map (so the agent never re-reads it to decide NEW vs
+   UPDATE), and project conventions into a compact system+user prompt, then
+   classifies DOCUMENT vs SKIP from the actual diff and the historical tree via
+   six guarded tools (git/read_file/list_dir/search_docs/write_doc/finish).
+   Root commits (giant initial snapshots) get a dedicated mode: a real tree
+   digest instead of the diffstat and a bigger step budget. On small-context
+   (~32k) models, config `limits.profile: "small"` tightens every injected
+   blob and compacts old tool results in the session history once
+   `prompt_tokens` crosses a threshold, keeping mid-session requests inside
+   the window.
 3. If DOCUMENT: the agent edits `agent/project/` (function/design docs + PROJECT.md nav).
    Commits that rename/move/delete files cited in docs trigger a path-hygiene pass
    even when they look like refactors.

@@ -34,7 +34,17 @@ Weak-model guardrails observed on real runs (fernflower):
   finish_reason) is refused with an explanation of the split-write technique
   (write the first half, then write_doc append) instead of a bare parse
   error - real runs retried the same giant write 7-10 times until the budget
-  died.
+  died;
+- context compaction (limits.compact_threshold_tokens > 0, e.g. the "small"
+  profile): the whole message history is normally re-sent on every
+  round-trip, which overflows small (~32k) context windows mid-session.
+  Once a request reports prompt_tokens at/above the threshold, OLDER tool
+  results are shrunk in place (the last compact_keep_groups assistant+tool
+  groups stay verbatim; message structure and tool_call ids are preserved,
+  so strict gateways still see a valid conversation) and each shrunken
+  result carries an explicit "re-read if needed" note. A duplicate re-read
+  whose previous result was compacted away is let through the duplicate
+  guard, so the model can always recover content it still needs.
 """
 
 import json
@@ -78,8 +88,66 @@ NUDGE_EMPTY = ("Your last response was empty (no content, no tool call - the "
                "preferably finish with your verdict.")
 
 
+def _estimate_prompt_tokens(messages):
+    """Rough chars/4 fallback for gateways that report no prompt_tokens."""
+    total = 0
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, str):
+            total += len(content)
+        for call in message.get("tool_calls") or []:
+            function = call.get("function") or call
+            total += len(str(function.get("arguments") or ""))
+    return total // 4
+
+
+def compact_history(messages, keep_groups, old_result_chars,
+                    old_text_chars=400):
+    """Downsample OLD assistant/tool groups in place (parity-safe).
+
+    A group is an assistant message carrying tool_calls plus the tool-result
+    messages that directly follow it. The last `keep_groups` groups stay
+    verbatim (the model acts on them right now); in older groups the
+    assistant narration and each tool result are shrunk to small caps, with
+    an explicit "re-read if needed" note. Nothing is dropped and no ids are
+    rewritten, so the sequence remains a valid OpenAI-compatible
+    conversation (every tool_call still answered by its tool result).
+
+    Returns the list of tool_call_ids whose results were shrunk (empty =
+    nothing to do; the pass is idempotent).
+    """
+    starts = [i for i, m in enumerate(messages)
+              if m.get("role") == "assistant" and m.get("tool_calls")]
+    if len(starts) <= keep_groups:
+        return []
+    first_kept = starts[len(starts) - keep_groups]
+    shrunk_ids = []
+    for index in range(starts[0], first_kept):
+        message = messages[index]
+        role = message.get("role")
+        if role == "assistant":
+            content = message.get("content")
+            if isinstance(content, str) and len(content) > old_text_chars:
+                # size the cut so the result lands exactly at the cap ->
+                # the pass is idempotent (a second run is a no-op)
+                suffix = " ...[compacted]"
+                keep = max(0, old_text_chars - len(suffix))
+                message["content"] = content[:keep] + suffix
+        elif role == "tool":
+            content = message.get("content") or ""
+            if len(content) > old_result_chars:
+                suffix = (" ... [older result compacted from %d chars - "
+                          "re-read the file/tool if you need it again]"
+                          % len(content))
+                keep = max(0, old_result_chars - len(suffix))
+                message["content"] = content[:keep] + suffix
+                shrunk_ids.append(message.get("tool_call_id"))
+    return shrunk_ids
+
+
 def run_agent(client, tools, system_prompt, first_user, max_steps, log,
-              validator=None, repair_rounds=0, transcript=None, reconsider=None):
+              validator=None, repair_rounds=0, transcript=None, reconsider=None,
+              limits=None):
     """Run the loop. Returns a verdict dict: {verdict, files, reason, steps, usage}.
 
     `reconsider` (optional) is called exactly once, after the model finishes
@@ -88,7 +156,18 @@ def run_agent(client, tools, system_prompt, first_user, max_steps, log,
     When it returns a message the finish is not accepted yet: the message is
     injected, the budget grows by RECONSIDER_EXTRA_STEPS, and the loop
     continues so the model can write docs and finish again (or reaffirm NO_DOC).
+
+    `limits` (optional, from config `limits` / resolve_limits) carries the
+    per-result cap and the compaction knobs; the defaults reproduce the
+    historical constants with compaction off.
     """
+    lim = limits if isinstance(limits, dict) else {}
+    tool_result_cap = max(2000, int(lim.get("tool_result_chars")
+                                    or MAX_TOOL_RESULT_CHARS))
+    compact_threshold = int(lim.get("compact_threshold_tokens") or 0)
+    compact_keep = max(1, int(lim.get("compact_keep_groups") or 4))
+    compact_cap = max(200, int(lim.get("compact_result_chars") or 2000))
+
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": first_user},
@@ -100,7 +179,12 @@ def run_agent(client, tools, system_prompt, first_user, max_steps, log,
     step = 0
     write_extensions = 0
     deadline_sent_at = None
-    seen_calls = {}       # canonical (name, args) -> True, for duplicate kicks
+    # canonical (name, args) -> [tool_call_ids of its LAST execution]; a
+    # repeat is refused unless its previous result was compacted away since
+    seen_calls = {}
+    shrunk_ids = set()   # tool_call_ids shrunk by compact_history so far
+    last_prompt_tokens = 0
+    compact_stalled = False  # last pass freed nothing; wait for new messages
     finish_only = False   # grace mode: every tool except finish is refused
     grace_used = False
     reconsider_used = False
@@ -117,11 +201,30 @@ def run_agent(client, tools, system_prompt, first_user, max_steps, log,
         """A single model round-trip + tool execution. True = stop the loop."""
         nonlocal budget, write_extensions, deadline_sent_at, finish_only
         nonlocal grace_used, step, empty_streak, repairs_used
-        nonlocal reconsider_used
+        nonlocal reconsider_used, last_prompt_tokens, compact_stalled
         step += 1
+        if compact_threshold and last_prompt_tokens >= compact_threshold \
+                and not compact_stalled:
+            shrunk = compact_history(messages, compact_keep, compact_cap)
+            if shrunk:
+                shrunk_ids.update(sid for sid in shrunk if sid)
+                log("context %d tokens >= %d - compacted %d old tool "
+                    "result(s) (last %d groups kept verbatim)"
+                    % (last_prompt_tokens, compact_threshold, len(shrunk),
+                       compact_keep))
+                record({"type": "compact", "step": step,
+                        "prompt_tokens": last_prompt_tokens,
+                        "results_shrunk": len(shrunk)})
+            else:
+                compact_stalled = True  # everything already small; retry later
         response = client.chat(messages, tools.definitions())
         for key in usage:
             usage[key] += int(response.get("usage", {}).get(key) or 0)
+        last_prompt_tokens = int(response.get("usage", {})
+                                 .get("prompt_tokens") or 0)
+        if not last_prompt_tokens:
+            last_prompt_tokens = _estimate_prompt_tokens(messages)
+        compact_stalled = False  # fresh content arrived; a pass may help again
         message = response["message"]
         messages.append(message)
         record({
@@ -203,24 +306,28 @@ def run_agent(client, tools, system_prompt, first_user, max_steps, log,
                             arguments, ensure_ascii=False, sort_keys=True)
                     except (TypeError, ValueError):
                         canonical = None
-                if canonical is not None and canonical in seen_calls:
-                    # exact repeat of an earlier call: refuse instead of
-                    # burning another round on the same output (fernflower
-                    # runs looped 5-7x on one git show / read_file)
+                prev_ids = seen_calls.get(canonical) if canonical else None
+                if prev_ids and not shrunk_ids.intersection(prev_ids):
+                    # exact repeat of an earlier call whose result is still
+                    # verbatim in the context: refuse instead of burning
+                    # another round on the same output (fernflower runs
+                    # looped 5-7x on one git show / read_file). Repeats whose
+                    # result was compacted away fall through - the model may
+                    # legitimately need that content again.
                     result = {"ok": False, "error": DUPLICATE_NOTE % name}
                     log("step %d/%d %s -> refused (exact duplicate of an "
                         "earlier call)" % (step, budget, name))
                 else:
-                    if canonical is not None:
-                        seen_calls[canonical] = True
+                    if canonical:
+                        seen_calls[canonical] = [call["id"]]
                     result = tools.execute(name, arguments)
             log("step %d/%d %s -> %s" % (step, budget, name,
                                          "ok" if result.get("ok") else "refused"))
             if name == "write_doc" and result.get("ok"):
                 wrote_this_step = True
             content = json.dumps(result, ensure_ascii=False)
-            if len(content) > MAX_TOOL_RESULT_CHARS:
-                content = content[:MAX_TOOL_RESULT_CHARS] + ' ... [truncated]"}'
+            if len(content) > tool_result_cap:
+                content = content[:tool_result_cap] + ' ... [truncated]"}'
             if budget - step < DEADLINE_WINDOW and name != "finish":
                 # deadline note rides on the tool results so the model sees it
                 # in the very next round-trip (9723-style "fixed everything,

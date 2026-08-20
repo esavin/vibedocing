@@ -10,6 +10,8 @@ history the model saw:
   {"type":"tool", ...}       one tool call: name, raw arguments, ok flag, and
                              the result exactly as it was fed back
   {"type":"user", ...}       pipeline-injected user message (repair feedback)
+  {"type":"compact", ...}    history compaction pass (limits profile): old
+                             tool results shrunk in place at this step
   {"type":"end", ...}        final verdict / error reason
 
 Summarize a transcript (context-growth curve, tool histogram, repeated calls,
@@ -85,6 +87,10 @@ def summarize(path):
     with_usage = [e for e in assistants if (e.get("usage") or {}).get("prompt_tokens")]
     if not with_usage:
         print("  (no per-step usage reported by the endpoint)")
+    compact_at = {}
+    for e in events:
+        if e.get("type") == "compact":
+            compact_at[e.get("step")] = e.get("results_shrunk")
     for e in assistants:
         usage = e.get("usage") or {}
         prompt = usage.get("prompt_tokens")
@@ -93,6 +99,9 @@ def summarize(path):
         reason = e.get("finish_reason")
         if reason not in (None, "stop", "tool_calls"):
             notes.append("finish_reason=%s" % reason)
+        if e.get("step") in compact_at:
+            notes.append("history compacted (%s result(s) shrunk)"
+                         % compact_at[e.get("step")])
         if not (e.get("content") or "").strip() and not e.get("tool_calls"):
             notes.append("empty response, no tool calls")
         names = [c.get("name") for c in (e.get("tool_calls") or [])]

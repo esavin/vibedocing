@@ -20,6 +20,52 @@ LLM_DEFAULTS = {
     "log_transcript": True,
 }
 
+# Context-budget knobs. Resolution order: defaults <- profile preset <-
+# explicit `limits` keys. The "default" profile reproduces the historical
+# hardcoded constants exactly, so existing configs behave identically.
+LIMIT_DEFAULTS = {
+    "profile": "default",
+    # per tool result kept in the session history (agent.py append-time cap)
+    "tool_result_chars": 100_000,
+    # per-tool output caps inside ToolSet (tools.py)
+    "git_output_chars": 150_000,
+    "read_file_chars": 80_000,
+    "list_dir_chars": 40_000,
+    # first-user-message injection caps (prompt.py)
+    "diffstat_chars": 30_000,
+    "name_status_chars": 20_000,
+    "tree_digest_chars": 8_000,
+    "conventions_chars": 12_000,
+    "docs_overview_chars": 6_000,
+    # history compaction (agent.py): 0 disables. When a request reports
+    # prompt_tokens >= compact_threshold_tokens, older tool results are
+    # shrunk in place to compact_result_chars; the last compact_keep_groups
+    # assistant+tool groups always stay verbatim.
+    "compact_threshold_tokens": 0,
+    "compact_keep_groups": 4,
+    "compact_result_chars": 2_000,
+}
+
+# Preset for ~32k-context models (self-hosted/desktop gateways): tight caps
+# on every injected blob plus compaction with headroom for the reply.
+LIMIT_PROFILES = {
+    "default": {},
+    "small": {
+        "tool_result_chars": 24_000,
+        "git_output_chars": 30_000,
+        "read_file_chars": 24_000,
+        "list_dir_chars": 16_000,
+        "diffstat_chars": 10_000,
+        "name_status_chars": 8_000,
+        "tree_digest_chars": 6_000,
+        "conventions_chars": 8_000,
+        "docs_overview_chars": 3_000,
+        "compact_threshold_tokens": 20_000,
+        "compact_keep_groups": 3,
+        "compact_result_chars": 1_500,
+    },
+}
+
 
 class ConfigError(Exception):
     """Fatal misconfiguration — the agent cannot start."""
@@ -103,3 +149,40 @@ def resolve_llm(config, cli_model=None, cli_max_steps=None):
         "extra_body": extra_body,
         "log_transcript": log_transcript,
     }
+
+
+def resolve_limits(config):
+    """Merge the `limits` config section into a flat dict of ints (+ profile).
+
+    `profile: "small"` bundles tighter caps and enables history compaction
+    for ~32k-token context models; any explicit key under `limits` overrides
+    the preset, so e.g. {"profile": "small", "compact_threshold_tokens": 16000}
+    works. With no `limits` section every value matches the historical
+    hardcoded constants and compaction is off.
+    """
+    section = config.get("limits")
+    if not isinstance(section, dict):
+        section = {}
+    profile = str(section.get("profile") or "default").strip().lower() or "default"
+    preset = LIMIT_PROFILES.get(profile)
+    if preset is None:
+        raise ConfigError("limits.profile must be one of: %s"
+                          % ", ".join(sorted(LIMIT_PROFILES)))
+    merged = dict(LIMIT_DEFAULTS)
+    merged.update(preset)
+    for key in LIMIT_DEFAULTS:
+        if key == "profile":
+            continue
+        if key in section and section[key] not in (None, ""):
+            merged[key] = section[key]
+    resolved = {"profile": profile}
+    for key, value in merged.items():
+        if key == "profile":
+            continue
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            raise ConfigError("limits.%s must be an integer" % key)
+        floor = 200 if key.endswith("_chars") else 0
+        resolved[key] = max(floor, number)
+    return resolved

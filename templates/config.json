@@ -15,6 +15,23 @@
 
   "scope": "",
 
+  "limits": {
+    "$comment": "Context budget. profile 'default' = historical caps, compaction off. profile 'small' = preset for ~32k-context models: tighter caps on every injected blob plus history compaction (once a request reports prompt_tokens >= compact_threshold_tokens, older tool results are shrunk in place to compact_result_chars; the last compact_keep_groups rounds stay verbatim). Any explicit key here overrides the profile. Tune compact_threshold_tokens to your window (leave headroom for the reply).",
+    "profile": "default",
+    "tool_result_chars": 100000,
+    "git_output_chars": 150000,
+    "read_file_chars": 80000,
+    "list_dir_chars": 40000,
+    "diffstat_chars": 30000,
+    "name_status_chars": 20000,
+    "tree_digest_chars": 8000,
+    "conventions_chars": 12000,
+    "docs_overview_chars": 6000,
+    "compact_threshold_tokens": 0,
+    "compact_keep_groups": 4,
+    "compact_result_chars": 2000
+  },
+
   "validation": {
     "$comment": "post-write docs validation. mode: strict = remaining errors flip the verdict to ERROR (commit retried); warn = report only; off. rounds: how many repair rounds the agent gets before the final verdict. path_check: severity of the 'cited repo path must exist in the worktree' check.",
     "mode": "strict",

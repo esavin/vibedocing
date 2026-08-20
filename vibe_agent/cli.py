@@ -22,7 +22,7 @@ import os
 import sys
 
 from .agent import run_agent
-from .config import ConfigError, load_config, resolve_llm
+from .config import ConfigError, load_config, resolve_llm, resolve_limits
 from .llm import ChatClient, FatalLLMError
 from .prompt import (InspectError, SYSTEM_PROMPT, build_first_user,
                      build_reconsider_message, load_prior_hint, sha_looks_valid)
@@ -135,6 +135,7 @@ def main(argv=None):
         config = load_config(args.config)
         llm = resolve_llm(config, cli_model=args.model or None,
                           cli_max_steps=args.max_steps or None)
+        limits = resolve_limits(config)
     except ConfigError as exc:
         print("vibe-agent: %s" % exc, file=sys.stderr)
         return 2
@@ -146,7 +147,8 @@ def main(argv=None):
     val_mode, val_rounds, path_check = validation_settings(config,
                                                            args.classify_only)
 
-    tools = ToolSet(worktree, docs_root, classify_only=args.classify_only)
+    tools = ToolSet(worktree, docs_root, classify_only=args.classify_only,
+                    limits=limits)
     client = ChatClient(
         base_url=llm["base_url"],
         api_key=llm["api_key"],
@@ -173,7 +175,8 @@ def main(argv=None):
     changed = 0
     try:
         first_user, info = build_first_user(args.sha, worktree, docs_root, mode,
-                                            today, read_conventions(docs_root))
+                                            today, read_conventions(docs_root),
+                                            limits=limits)
         old_paths = info["old_paths"]
         root_commit = info["is_root"]
         changed = info.get("changed", 0)
@@ -232,10 +235,13 @@ def main(argv=None):
             # tool rounds: +1 step per 8 changed files, capped at max_steps_cap
             boost = min(max(0, llm["max_steps_cap"] - max_steps), changed // 8)
             max_steps += boost
-        log("model=%s endpoint=%s mode=%s root_commit=%s steps<=%d%s validation=%s/%d"
+        limits_label = limits["profile"]
+        if limits["compact_threshold_tokens"]:
+            limits_label += " (compact >= %d tokens)" % limits["compact_threshold_tokens"]
+        log("model=%s endpoint=%s mode=%s root_commit=%s steps<=%d%s validation=%s/%d limits=%s"
             % (llm["model"], llm["base_url"], mode, root_commit, max_steps,
                (" (+%d for %d changed files)" % (boost, changed)) if boost else "",
-               val_mode, val_rounds))
+               val_mode, val_rounds, limits_label))
         if transcript is not None:
             transcript.record({
                 "type": "session",
@@ -246,6 +252,8 @@ def main(argv=None):
                 "root_commit": root_commit,
                 "max_steps": max_steps,
                 "repair_rounds": val_rounds,
+                "limits_profile": limits["profile"],
+                "compact_threshold_tokens": limits["compact_threshold_tokens"],
                 "system_prompt_chars": len(SYSTEM_PROMPT),
                 "first_user_chars": len(first_user),
             })
@@ -253,7 +261,8 @@ def main(argv=None):
             verdict = run_agent(client, tools, SYSTEM_PROMPT, first_user,
                                 max_steps, log,
                                 validator=validator, repair_rounds=val_rounds,
-                                transcript=transcript, reconsider=reconsider)
+                                transcript=transcript, reconsider=reconsider,
+                                limits=limits)
         except FatalLLMError as exc:
             verdict = {"verdict": "ERROR", "files": [], "reason":
                        "llm: %s" % exc, "steps": 0,

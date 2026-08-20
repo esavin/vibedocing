@@ -144,6 +144,27 @@ After every DOC_UPDATED verdict the docs map is validated mechanically (config
 - Each agent call is a fresh short-lived process — there is no server to keep warm.
   A cheap/smaller model is often enough: the system prompt is ~1K tokens and the commit
   metadata + diffstat are pre-injected, so most SKIP verdicts cost a single round-trip.
+- Small-context (~32k) models: set `"limits": {"profile": "small"}` in config.json.
+  The profile bundles tighter caps on every injected blob (diffstat, name-status,
+  conventions, per-tool-result) **and enables history compaction**: normally the whole
+  message history is re-sent on every tool round-trip, which overflows a 32k window
+  mid-session (HTTP 400/context-length → ERROR → requeue). With compaction on, once a
+  request reports `prompt_tokens` ≥ `compact_threshold_tokens` (20k in the profile),
+  older tool results are shrunk in place to `compact_result_chars`; the last
+  `compact_keep_groups` assistant+tool rounds stay verbatim, message structure and
+  tool-call ids are preserved (valid for strict gateways), and each shrunken result
+  says "re-read if needed" — a duplicate re-read whose result was compacted away is
+  allowed through the duplicate guard. Set `compact_threshold_tokens` to roughly
+  window minus max reply size (e.g. 24k on a 32k model with 8k output).
+- Every cap is individually configurable under `limits` (see `templates/config.json`);
+  explicit keys override the profile, e.g. `{"profile": "small",
+  "compact_threshold_tokens": 16000}`. With no `limits` section all values match the
+  historical defaults and compaction is off. On prefix-cached endpoints (OpenAI, vLLM),
+  leave compaction off unless the window demands it — rewriting old messages misses
+  the cache (the default append-only history hits it).
+- The first user message carries a **DOCS MAP OVERVIEW** (one line per existing doc +
+  its title), rebuilt mechanically from disk each commit — the agent decides NEW vs
+  UPDATE from it instead of re-reading PROJECT.md and the doc list every session.
 - `run_timeout_seconds` (config) caps each agent call if `timeout` is available.
 - `model` (config `llm.model`, env `VIBE_MODEL`, or `--model`) picks the model.
 
@@ -233,7 +254,9 @@ PYTHONPATH=vibedocing python3 -m vibe_agent --config vibedocing/config.json \
     pressure, not model quality: the first message plus large tool results
     (`git show` on a big commit, `read_file` on huge files) crowd out the
     instructions. Mitigate by splitting the work (`scope` for the giant root
-    commit), lowering `max_steps`, or using a model with a larger window.
+    commit), lowering `max_steps`, using a model with a larger window, or — on a
+    small-window model — `"limits": {"profile": "small"}` (tighter caps +
+    history compaction, see Performance above).
   - identical tool calls repeated, plain-text answers that never call `finish`,
     or garbage tool arguments at a small token count → the model itself is too
     weak for tool loops; switch model (see the Qwen/gpt-oss notes above). The

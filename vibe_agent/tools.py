@@ -62,11 +62,17 @@ def _truncate(text, limit):
 
 
 class ToolSet(object):
-    def __init__(self, worktree, docs_root, classify_only=False):
+    def __init__(self, worktree, docs_root, classify_only=False, limits=None):
         self.worktree = os.path.realpath(str(worktree))
         self.docs_root = os.path.realpath(str(docs_root))
         self.classify_only = classify_only
         self.read_roots = [self.worktree, self.docs_root]
+        # Output caps (config `limits` section; module constants are the
+        # defaults, so a missing section reproduces the historical sizes).
+        lim = limits if isinstance(limits, dict) else {}
+        self.git_output_chars = max(200, int(lim.get("git_output_chars") or MAX_GIT_CHARS))
+        self.read_file_chars = max(200, int(lim.get("read_file_chars") or MAX_READ_CHARS))
+        self.list_dir_chars = max(200, int(lim.get("list_dir_chars") or MAX_LIST_CHARS))
         self.finish_result = None
         self.wrote_docs = False  # any successful write_doc call this session
         self.written_files = []  # docs-root-relative paths written/deleted
@@ -339,7 +345,7 @@ class ToolSet(object):
         return {
             "ok": proc.returncode == 0,
             "exit_code": proc.returncode,
-            "output": _truncate(output.rstrip(), MAX_GIT_CHARS),
+            "output": _truncate(output.rstrip(), self.git_output_chars),
         }
 
     def _tool_read_file(self, args):
@@ -377,8 +383,8 @@ class ToolSet(object):
                 line = line[:MAX_LINE_CHARS] + "... [line truncated]"
             numbered.append("%d: %s" % (index, line))
             total += len(numbered[-1]) + 1
-            if total > MAX_READ_CHARS:
-                numbered.append("... [output truncated at %d chars]" % MAX_READ_CHARS)
+            if total > self.read_file_chars:
+                numbered.append("... [output truncated at %d chars]" % self.read_file_chars)
                 break
         return {
             "ok": True,
@@ -429,7 +435,7 @@ class ToolSet(object):
                     entries.append("... [entry cap reached]")
                     break
         return {"ok": True, "path": real, "recursive": recursive,
-                "entries": _truncate("\n".join(entries), MAX_LIST_CHARS)}
+                "entries": _truncate("\n".join(entries), self.list_dir_chars)}
 
     def _tool_search_docs(self, args):
         pattern = args.get("pattern")
@@ -469,7 +475,7 @@ class ToolSet(object):
             if truncated:
                 break
         result = {"ok": True, "pattern": pattern,
-                  "matches": _truncate("\n".join(matches), MAX_LIST_CHARS),
+                  "matches": _truncate("\n".join(matches), self.list_dir_chars),
                   "count": len(matches)}
         if truncated:
             result["note"] = ("match cap reached; narrow the pattern or use "

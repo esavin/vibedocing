@@ -434,10 +434,60 @@ def docs_numbering(docs_root):
     return "\n".join(lines)
 
 
-def build_first_user(sha, worktree, docs_root, mode, today, conventions):
+def docs_overview(docs_root, max_chars=6000, max_entries=80):
+    """One line per existing doc (path + title from its first heading).
+
+    Mechanically rebuilt from disk for every commit - like docs_numbering -
+    so it can never go stale. Injecting it into the first user message lets
+    the agent decide NEW vs UPDATE without spending read_file steps
+    re-discovering the map (Problem 2 of the perf report: per-commit
+    re-reading of PROJECT.md and the doc list).
+    """
+    from vibe_agent.validate import DOCS_TOP_DIRS
+    candidates = []
+    hub = os.path.join(docs_root, "PROJECT.md")
+    if os.path.isfile(hub):
+        candidates.append(("PROJECT.md", hub))
+    for directory in sorted(DOCS_TOP_DIRS):
+        dpath = os.path.join(docs_root, directory)
+        if not os.path.isdir(dpath):
+            continue
+        for name in sorted(os.listdir(dpath)):
+            if name.startswith(".") or not name.lower().endswith(".md"):
+                continue
+            candidates.append(("%s/%s" % (directory, name),
+                               os.path.join(dpath, name)))
+    rows = []
+    for rel, path in candidates:
+        title = ""
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh.read(4000).splitlines():
+                    if line.startswith("# "):
+                        title = line[2:].strip()
+                        break
+        except OSError:
+            pass
+        rows.append("- %s - %s" % (rel, title or "(untitled)"))
+    if not rows:
+        return ""
+    more = ""
+    if len(rows) > max_entries:
+        more = "\n(+%d more - enumerate with list_dir functions/ design/)" \
+               % (len(rows) - max_entries)
+        rows = rows[:max_entries]
+    text = "\n".join(rows) + more
+    if len(text) > max_chars:
+        text = text[:max_chars] + "\n... [truncated]"
+    return text
+
+
+def build_first_user(sha, worktree, docs_root, mode, today, conventions,
+                     limits=None):
     """Build the first user message. Returns (text, info) where info carries
     {"is_root": bool, "old_paths": [...], "changed": int} for the caller
     (validation old-paths and adaptive step budgeting)."""
+    lim = limits if isinstance(limits, dict) else {}
     subject = _git(worktree, ["log", "-1", "--format=%s", sha]).strip()
     message = _git(worktree, ["log", "-1", "--format=%B", sha]).strip()
 
@@ -456,17 +506,21 @@ def build_first_user(sha, worktree, docs_root, mode, today, conventions):
             "upstream docs) - the worktree at this commit is the only source."
         )
         sections.append("TREE DIGEST (git ls-tree at this commit):\n%s"
-                        % _cap(_tree_digest(worktree, sha), 8000))
+                        % _cap(_tree_digest(worktree, sha),
+                               int(lim.get("tree_digest_chars") or 8000)))
     else:
         parent = parent_sha(worktree, sha)
         if parent:
             status_text, old_paths, changed = name_status(worktree, parent, sha)
             if status_text:
                 sections.append("NAME STATUS (git diff --name-status -M, "
-                                "renames/deletions first):\n%s" % _cap(status_text, 20000))
+                                "renames/deletions first):\n%s"
+                                % _cap(status_text,
+                                       int(lim.get("name_status_chars") or 20000)))
         stat = _git(worktree, ["show", "--stat", "--format=", sha]).strip("\n")
         sections.append("DIFFSTAT (git show --stat):\n%s"
-                        % _cap("\n".join(stat.splitlines()[:300]), 30000) or "(empty)")
+                        % _cap("\n".join(stat.splitlines()[:300]),
+                               int(lim.get("diffstat_chars") or 30000)) or "(empty)")
 
     if old_paths:
         stale = stale_doc_references(docs_root, old_paths)
@@ -482,6 +536,16 @@ def build_first_user(sha, worktree, docs_root, mode, today, conventions):
         sections.append(
             "DOCS NUMBERING (exact current state - use these numbers, do not "
             "compute your own):\n%s" % numbering
+        )
+
+    overview = docs_overview(docs_root,
+                             int(lim.get("docs_overview_chars") or 6000))
+    if overview:
+        sections.append(
+            "DOCS MAP OVERVIEW (every existing doc with its title - decide "
+            "NEW vs UPDATE from this list; read a specific doc ONLY if you "
+            "will edit it, and never create a second doc for a topic already "
+            "listed here):\n%s" % overview
         )
 
     if not conventions:
@@ -503,7 +567,7 @@ def build_first_user(sha, worktree, docs_root, mode, today, conventions):
         "TODAY: %s" % today,
         "",
         "PROJECT CONVENTIONS (from project-conventions.md):",
-        _cap(conventions.strip(), 12000),
+        _cap(conventions.strip(), int(lim.get("conventions_chars") or 12000)),
         "",
         "Begin: inspect the commit, classify, act if warranted, then call finish.",
     ])
