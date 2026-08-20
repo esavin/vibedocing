@@ -216,7 +216,10 @@ After every `DOC_UPDATED` verdict the pipeline validates the docs map mechanical
 3. **links** — every relative markdown link resolves to an existing doc;
 4. **paths** — cited repository paths (anything path-shaped with a slash and a file
    extension) exist in the worktree at this commit;
-5. **stale refs** — no doc cites a path renamed/deleted by this commit.
+5. **stale refs** — no doc cites a path renamed/deleted by this commit;
+6. **orphan nav** — every `functions/` and `design/` doc is linked from `PROJECT.md`
+   (warning-level; the pipeline also re-adds missing navigation links itself
+   after each processed commit, so coverage cannot drift for long).
 
 Problems are fed back to the agent for up to `validation.rounds` repair rounds
 (config). If deterministic errors remain in `strict` mode (default), the verdict

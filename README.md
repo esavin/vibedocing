@@ -74,12 +74,15 @@ mywork/                         <- workspace (its own git repo)
    Commits that rename/move/delete files cited in docs trigger a path-hygiene pass
    even when they look like refactors.
 4. The docs are then **validated mechanically** (internal links, unique doc numbering,
-   fixed layout, cited repo paths exist in the worktree, no stale renamed paths).
+   fixed layout, cited repo paths exist in the worktree, no stale renamed paths,
+   every doc linked from the hub).
    Problems are fed back to the agent for repair rounds; in strict mode remaining
    errors block publication and the commit is requeued.
 5. `run.sh` reads the agent's verdict (`vibedocing/verdicts/<sha>.json` + a one-line
    `.txt`), advances the committed baseline (`agent/project/.vibedocing.json`),
-   auto-fills PROJECT.md's Sync Status, and **git-commits** the doc changes
+   auto-fills PROJECT.md's Sync Status, re-links any doc missing from the hub's
+   navigation (deterministic self-heal — the agent's per-commit rewrites can drop
+   old links), and **git-commits** the doc changes
    (`docs(<project>): <subject>`).
 
 ## Restart after upstream changes
@@ -124,7 +127,7 @@ visible in the verdict JSON (`"reconsidered": true`) and the transcript
 ```
 --list               show PROCESS/SKIP/DONE decisions, no agent calls
 --dry-run            classify only (no doc writes, no commits)
---validate [SHA]     audit existing docs (links, numbering, paths) vs the tree at SHA
+--validate [SHA]     audit existing docs (links, numbering, paths, hub coverage) vs the tree at SHA
 --limit N            process at most N commits
 --range A..B         process a specific range
 --sha S              process a single commit

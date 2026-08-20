@@ -2,9 +2,10 @@
 
 Rationale: an external audit of generated docs found broken internal links, duplicate
 doc numbering, paths prefixed with a workspace folder that is not part of the
-repository, references to files renamed/deleted later, and identifiers written from
-memory. All of these are mechanically checkable, so the pipeline now validates after
-every doc-writing commit and feeds the problems back to the agent for repair.
+repository, references to files renamed/deleted later, identifiers written from
+memory, and docs that silently lost their PROJECT.md navigation entry. All of these
+are mechanically checkable, so the pipeline now validates after every doc-writing
+commit and feeds the problems back to the agent for repair.
 
 Checks:
  1. layout - the docs root contains only the fixed top-level entries
@@ -20,6 +21,11 @@ Checks:
              and citations of files that no longer exist.
  5. stale  - no doc still cites a path renamed/deleted by the commit under review
              (old paths come from the rename-aware name-status of this commit).
+ 6. orphans - every functions/ and design/ doc is linked from PROJECT.md (the
+              reverse direction of the links check). Warnings only: the
+              pipeline's hub reconciliation (vibe_agent/hub.py) re-adds missing
+              links itself after each processed commit, so this is a drift
+              signal, not a repair task for the agent.
 
 Severities: errors are deterministic and block publication in strict mode; warnings
 are heuristics recorded in the report. Usable standalone:
@@ -194,6 +200,39 @@ def check_stale(docs_root, old_paths, errors):
                               % (rel, old))
 
 
+def check_orphans(docs_root, warnings):
+    """Reverse direction of check_links: every functions/ and design/ doc must
+    be reachable from PROJECT.md, the navigation hub. The agent rewrites the
+    hub per commit in a small context and old entries fall out (orphan drift);
+    this reports the drift. Warnings only - vibe_agent/hub.py heals them."""
+    hub = os.path.join(docs_root, "PROJECT.md")
+    if not os.path.isfile(hub):
+        return
+    linked = set()
+    for match in _LINK_RE.finditer(_read(hub)):
+        target = match.group(2).strip()
+        if not target or target.startswith(_SKIP_PREFIXES):
+            continue
+        target = target.split("#", 1)[0].split()[0]
+        if not target:
+            continue
+        rel = os.path.relpath(os.path.normpath(os.path.join(docs_root, target)),
+                              docs_root)
+        linked.add(rel.replace(os.sep, "/"))
+    for directory in sorted(DOCS_TOP_DIRS):
+        path = os.path.join(docs_root, directory)
+        if not os.path.isdir(path):
+            continue
+        for name in sorted(os.listdir(path)):
+            if name.startswith(".") or not name.lower().endswith(".md"):
+                continue
+            if "%s/%s" % (directory, name) not in linked:
+                warnings.append(
+                    "%s/%s: not linked from PROJECT.md (navigation coverage; "
+                    "the pipeline re-adds missing links itself after this "
+                    "commit)" % (directory, name))
+
+
 def validate_docs(docs_root, worktree=None, old_paths=(), path_check="error"):
     """Run all checks. Returns {"errors": [...], "warnings": [...]}."""
     errors, warnings = [], []
@@ -207,6 +246,7 @@ def validate_docs(docs_root, worktree=None, old_paths=(), path_check="error"):
     elif path_check == "warn":
         warnings.extend(path_problems)
     check_stale(docs_root, old_paths, errors)
+    check_orphans(docs_root, warnings)
     return {"errors": errors, "warnings": warnings}
 
 
@@ -262,7 +302,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="vibe-agent-validate",
         description="Validate the documentation map (links, numbering, layout, "
-                    "source paths, stale references).")
+                    "source paths, stale references, hub coverage).")
     parser.add_argument("--docs-root", required=True)
     parser.add_argument("--worktree", default="",
                         help="worktree with the project at the commit being documented "

@@ -120,7 +120,9 @@ After every DOC_UPDATED verdict the docs map is validated mechanically (config
 `validation`):
 - checks: fixed layout; `<number>-<name>.md` naming with unique numbers per
   directory; all relative markdown links resolve; path-shaped references resolve in
-  the worktree; nothing cites paths renamed/deleted by this commit;
+  the worktree; nothing cites paths renamed/deleted by this commit; every
+  functions/design doc is linked from PROJECT.md (warning-level orphan check —
+  see the hub reconciliation below);
 - problems go back to the agent for up to `validation.rounds` repair rounds; each
   repair round **extends the step budget by 6 steps** (validation feedback must
   never eat the steps the model needs to fix and re-finish), and in the last two
@@ -230,7 +232,9 @@ identity defaults to `vibedocing <vibedocing@local>` (set in config / by bootstr
 - `agent.py` — the loop; ends only via the `finish` tool; supports validation-driven
   repair rounds.
 - `validate.py` — the mechanical docs validator (also a standalone CLI).
-- `hub.py` — deterministic PROJECT.md Sync Status maintenance.
+- `hub.py` — deterministic PROJECT.md maintenance: Sync Status bullets and full
+  navigation coverage (after each processed commit it re-adds links for docs the
+  agent's hub rewrites dropped and removes links to deleted docs).
 
 You can run one step standalone (as `run.sh` does):
 ```bash
