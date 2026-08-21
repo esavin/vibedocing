@@ -69,7 +69,11 @@ mywork/                         <- workspace (its own git repo)
    (~32k) models, config `limits.profile: "small"` tightens every injected
    blob and compacts old tool results in the session history once
    `prompt_tokens` crosses a threshold, keeping mid-session requests inside
-   the window.
+   the window. If the provider still rejects a request as too big (HTTP
+   400 context-limit), the agent runs escalating emergency compaction
+   (including oversized injected messages such as validator feedback),
+   retries in place, and lowers its compaction threshold to the
+   provider-reported window for the rest of the session.
 3. If DOCUMENT: the agent edits `agent/project/` (function/design docs + PROJECT.md nav).
    Commits that rename/move/delete files cited in docs trigger a path-hygiene pass
    even when they look like refactors.

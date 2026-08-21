@@ -160,6 +160,16 @@ After every DOC_UPDATED verdict the docs map is validated mechanically (config
   says "re-read if needed" — a duplicate re-read whose result was compacted away is
   allowed through the duplicate guard. Set `compact_threshold_tokens` to roughly
   window minus max reply size (e.g. 24k on a 32k model with 8k output).
+- **Overflow auto-recovery**: compaction shrinks only old assistant/tool groups, so a
+  session can still exceed the window when a NEW user message is huge (a validator
+  repair list with 100+ errors is ~30k chars) or when results already sit at the caps.
+  When the endpoint answers HTTP 400 "context too long" (Russian or English wording),
+  the agent detects it, runs escalating emergency passes — halve/quarter the result cap,
+  truncate oversized user messages (the task brief only as the last resort) — retries
+  the same request, and adapts `compact_threshold_tokens` to ~0.82× the provider-reported
+  window (parsed from the error) for the rest of the session. No restart, no requeue:
+  the commit finishes with a slightly degraded context instead of ERRORing out. The
+  recovery is visible in the transcript as `"type": "overflow"` events.
 - Every cap is individually configurable under `limits` (see `templates/config.json`);
   explicit keys override the profile, e.g. `{"profile": "small",
   "compact_threshold_tokens": 16000}`. With no `limits` section all values match the

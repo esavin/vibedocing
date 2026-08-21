@@ -7,6 +7,7 @@ plain POST with retries is all that is needed. Swapping this module for the
 
 import json
 import random
+import re
 import time
 import urllib.error
 import urllib.request
@@ -16,9 +17,54 @@ RETRYABLE_HTTP = {429, 500, 502, 503, 504}
 # 16 minutes between HTTP-level retries instead of burning them within seconds.
 HTTP_BACKOFF_SECONDS = (60, 120, 240, 480, 960)
 
+# HTTP 400 bodies that mean "input exceeds the context/token window".
+# neuraldeep.ru reports in Russian ("Слишком длинный запрос: N токенов входа
+# при пределе M"); OpenAI/vLLM/others send English variants.
+_OVERFLOW_MARKERS = (
+    "слишком длинн", "токенов входа", "context_length", "context length",
+    "maximum context", "prompt is too long", "too many tokens",
+    "reduce the length", "reduce your prompt", "input too large",
+)
+_OVERFLOW_PAIRS = (
+    ("token", "too long"), ("токен", "предел"), ("токен", "превыш"),
+    ("token", "exceed"),
+)
+# "при пределе 46112" / "context length is 128000 tokens" -> the window size
+_LIMIT_RE = re.compile(
+    r"(?:пределе|limit|length|maximum|max)[^\d]{0,30}(\d{4,})", re.IGNORECASE)
+
 
 class FatalLLMError(Exception):
     """Endpoint error that retries cannot fix (or retries exhausted)."""
+
+
+class ContextOverflowError(FatalLLMError):
+    """HTTP 400: the request exceeds the provider's context/input-token limit.
+
+    Retrying the identical body can never succeed - the caller must shrink
+    the request first. `.limit` carries the provider-reported window size
+    (input tokens) when parseable, so the caller can adapt its budget.
+    """
+
+    def __init__(self, message, limit=None):
+        FatalLLMError.__init__(self, message)
+        self.limit = limit
+
+
+def _is_context_overflow(detail):
+    text = detail.lower()
+    for marker in _OVERFLOW_MARKERS:
+        if marker in text:
+            return True
+    for first, second in _OVERFLOW_PAIRS:
+        if first in text and second in text:
+            return True
+    return False
+
+
+def _context_limit(detail):
+    match = _LIMIT_RE.search(detail)
+    return int(match.group(1)) if match else None
 
 
 class ChatClient(object):
@@ -60,6 +106,10 @@ class ChatClient(object):
                 return self._parse(data)
             except urllib.error.HTTPError as exc:
                 detail = exc.read()[:400].decode("utf-8", "replace")
+                if exc.code == 400 and _is_context_overflow(detail):
+                    raise ContextOverflowError(
+                        "HTTP 400 from %s: %s" % (self.url, detail),
+                        _context_limit(detail))
                 if exc.code in RETRYABLE_HTTP and attempt < self.retries:
                     last_error = "HTTP %d: %s" % (exc.code, detail)
                     time.sleep(self._backoff(attempt,

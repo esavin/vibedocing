@@ -45,9 +45,21 @@ Weak-model guardrails observed on real runs (fernflower):
   result carries an explicit "re-read if needed" note. A duplicate re-read
   whose previous result was compacted away is let through the duplicate
   guard, so the model can always recover content it still needs.
+- provider context-limit 400s (llm.ContextOverflowError): when the gateway
+  still rejects an oversized request despite compaction (e.g. a huge
+  validator repair message arrives as a NEW user message that
+  compact_history never touches), the loop runs escalating emergency
+  passes - halve/quarter the result cap, keep only the last group verbatim,
+  truncate oversized injected user messages and (last resort) the task
+  brief itself - retries the request, and adapts the compaction threshold
+  to the provider-reported window so later growth compacts before hitting
+  it again. Only when every pass frees nothing does the error escape as an
+  ERROR verdict.
 """
 
 import json
+
+from .llm import ContextOverflowError
 
 MAX_TOOL_RESULT_CHARS = 100_000
 REPAIR_EXTRA_STEPS = 6
@@ -56,6 +68,11 @@ WRITE_EXTENSIONS = 2
 RECONSIDER_EXTRA_STEPS = 8  # budget for the one-shot prior-docs reconsideration
 DEADLINE_WINDOW = 5  # last N steps of the budget get deadline pressure
 EMPTY_ABORT_THRESHOLD = 3
+# escalating emergency passes after a provider context-limit 400 (see
+# _overflow_shrink); each must free chars or the session errors out
+OVERFLOW_ATTEMPTS = 4
+OVERFLOW_FLOOR_CHARS = 400  # hard floor for tool results in emergencies
+OVERFLOW_USER_CHARS = (6000, 2500)  # per-pass cap for injected user messages
 # responses at/above this many completion tokens are treated as cut (the
 # neuraldeep gateway caps output at 8000 without setting finish_reason)
 CUT_TOKEN_THRESHOLD = 7900
@@ -145,6 +162,64 @@ def compact_history(messages, keep_groups, old_result_chars,
     return shrunk_ids
 
 
+def _overflow_shrink(messages, attempt, keep_groups, result_chars):
+    """One escalating emergency pass after a provider context-limit 400.
+
+    compact_history alone cannot save a session whose bulk sits in injected
+    USER messages (validator repair lists, reconsider hints) or in results
+    that are already at/below the configured caps. The ladder:
+
+      0: normal compaction pass (fresh content may have arrived meanwhile)
+      1: keep only the LAST assistant+tool group verbatim, halve the cap
+      2: quarter the cap, cap ANY tool result regardless of group position,
+         truncate oversized user messages (messages[2:] - nudges, validator
+         feedback, hints; the task brief messages[1] stays protected)
+      3: hard floor everywhere, the task brief itself truncated too
+
+    Every pass stays parity-safe: contents shrink in place, nothing is
+    dropped, tool_call ids are untouched. Returns (chars_freed,
+    tool_call_ids_shrunk); (0, []) means this pass could not help.
+    """
+    keep = keep_groups if attempt == 0 else 1
+    cap = result_chars
+    if attempt == 1:
+        cap = max(OVERFLOW_FLOOR_CHARS, result_chars // 2)
+    elif attempt == 2:
+        cap = max(OVERFLOW_FLOOR_CHARS, result_chars // 4)
+    elif attempt >= 3:
+        cap = OVERFLOW_FLOOR_CHARS
+    before = sum(len(m.get("content")) for m in messages
+                 if isinstance(m.get("content"), str))
+    shrunk = compact_history(messages, keep, cap,
+                             old_text_chars=400 if attempt == 0 else 200)
+    if attempt >= 2:
+        suffix = " ...[truncated to fit the model context window]"
+        user_cap = OVERFLOW_USER_CHARS[min(attempt - 2,
+                                           len(OVERFLOW_USER_CHARS) - 1)]
+        for index, message in enumerate(messages):
+            role = message.get("role")
+            content = message.get("content")
+            if not isinstance(content, str):
+                continue
+            if role == "tool" and len(content) > cap:
+                # compact_history keeps the last groups verbatim and skips
+                # single-group sessions; in an emergency cap them directly
+                # (the model can re-read the source via the tools)
+                message["content"] = content[:max(0, cap - len(suffix))] + suffix
+                if message.get("tool_call_id"):
+                    shrunk.append(message["tool_call_id"])
+            elif role == "user" and len(content) > user_cap:
+                # protect the original task brief (messages[1]) until the
+                # very last pass - losing it degrades grounding
+                if index <= 1 and attempt < OVERFLOW_ATTEMPTS - 1:
+                    continue
+                message["content"] = (content[:max(0, user_cap - len(suffix))]
+                                      + suffix)
+    after = sum(len(m.get("content")) for m in messages
+                if isinstance(m.get("content"), str))
+    return before - after, shrunk
+
+
 def run_agent(client, tools, system_prompt, first_user, max_steps, log,
               validator=None, repair_rounds=0, transcript=None, reconsider=None,
               limits=None):
@@ -202,6 +277,7 @@ def run_agent(client, tools, system_prompt, first_user, max_steps, log,
         nonlocal budget, write_extensions, deadline_sent_at, finish_only
         nonlocal grace_used, step, empty_streak, repairs_used
         nonlocal reconsider_used, last_prompt_tokens, compact_stalled
+        nonlocal compact_threshold
         step += 1
         if compact_threshold and last_prompt_tokens >= compact_threshold \
                 and not compact_stalled:
@@ -217,7 +293,49 @@ def run_agent(client, tools, system_prompt, first_user, max_steps, log,
                         "results_shrunk": len(shrunk)})
             else:
                 compact_stalled = True  # everything already small; retry later
-        response = client.chat(messages, tools.definitions())
+        overflow_pass = 0
+        while True:
+            try:
+                response = client.chat(messages, tools.definitions())
+                break
+            except ContextOverflowError as exc:
+                # The gateway rejected the request as too big even though
+                # compaction may already have run (its bulk can sit in
+                # injected USER messages - e.g. a validator repair list -
+                # which compact_history never touches). Shrink harder and
+                # retry; surrender only when no pass can free anything.
+                while overflow_pass < OVERFLOW_ATTEMPTS:
+                    freed, ids = _overflow_shrink(messages, overflow_pass,
+                                                  compact_keep, compact_cap)
+                    overflow_pass += 1
+                    if freed > 0:
+                        shrunk_ids.update(sid for sid in ids if sid)
+                        log("context overflow (HTTP 400) - emergency pass "
+                            "%d/%d freed ~%d chars, retrying"
+                            % (overflow_pass, OVERFLOW_ATTEMPTS, freed))
+                        record({"type": "overflow", "step": step,
+                                "pass": overflow_pass,
+                                "chars_freed": freed,
+                                "provider_limit": exc.limit})
+                        break
+                else:
+                    raise
+                # adapt the budget for the REST of the session: from now on
+                # compact early enough that growth never reaches the window
+                # again (0.82 of the provider limit leaves headroom for the
+                # reply and the tool schemas the gateway also counts)
+                target = 0
+                if exc.limit:
+                    target = max(1000, int(exc.limit * 0.82))
+                elif compact_threshold:
+                    target = max(1000, compact_threshold * 3 // 4)
+                if target and (not compact_threshold
+                               or target < compact_threshold):
+                    compact_threshold = target
+                    compact_stalled = False
+                    log("compaction threshold adapted to %d tokens%s"
+                        % (target, " (provider limit %d)" % exc.limit
+                           if exc.limit else ""))
         for key in usage:
             usage[key] += int(response.get("usage", {}).get(key) or 0)
         last_prompt_tokens = int(response.get("usage", {})
