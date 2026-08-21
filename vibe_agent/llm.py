@@ -137,9 +137,10 @@ class ChatClient(object):
         payload = {
             "model": self.model,
             "messages": messages,
-            "tools": tools,
-            "tool_choice": "auto",
         }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
         if self.max_tokens:
             payload["max_tokens"] = self.max_tokens
         if self.temperature is not None:

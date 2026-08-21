@@ -32,6 +32,19 @@
     "compact_result_chars": 2000
   },
 
+  "classifier": {
+    "$comment": "Parallel pre-classifier (run.sh --classifier). A cheap model pre-decides DOCUMENT vs SKIP for upcoming commits so the full agent only runs for DOCUMENT ones. model is required to use the mode. base_url/api_key_env left empty inherit the llm section (same provider and key); set them to use a different provider. workers = parallel classification requests; queue = how many DOCUMENT verdicts may wait ahead of the main loop (small = little lost work on interrupt). Mutually exclusive with --reuse-verdicts.",
+    "model": "",
+    "base_url": "",
+    "api_key_env": "",
+    "workers": 3,
+    "queue": 2,
+    "temperature": null,
+    "max_tokens": 0,
+    "request_timeout_seconds": 0,
+    "retries": 0
+  },
+
   "validation": {
     "$comment": "post-write docs validation. mode: strict = remaining errors flip the verdict to ERROR (commit retried); warn = report only; off. rounds: how many repair rounds the agent gets before the final verdict. path_check: severity of the 'cited repo path must exist in the worktree' check.",
     "mode": "strict",

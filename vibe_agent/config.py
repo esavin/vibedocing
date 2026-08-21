@@ -71,6 +71,23 @@ LIMIT_PROFILES = {
 }
 
 
+# Parallel pre-classifier (--classifier in run.sh): a cheap model pre-decides
+# DOCUMENT vs SKIP so the expensive agent only runs for DOCUMENT commits.
+# Empty base_url/api_key_env inherit the resolved `llm` section (same provider
+# and key); 0-valued timeout/retries inherit too.
+CLASSIFIER_DEFAULTS = {
+    "model": "",
+    "base_url": "",
+    "api_key_env": "",
+    "workers": 3,   # parallel classification requests
+    "queue": 2,     # max DOCUMENT verdicts held ahead of the main loop
+    "temperature": None,
+    "max_tokens": 0,
+    "request_timeout_seconds": 0,
+    "retries": 0,
+}
+
+
 class ConfigError(Exception):
     """Fatal misconfiguration — the agent cannot start."""
 
@@ -190,3 +207,52 @@ def resolve_limits(config):
         floor = 200 if key.endswith("_chars") else 0
         resolved[key] = max(floor, number)
     return resolved
+
+
+def resolve_classifier(config, llm):
+    """Merge the `classifier` section over the RESOLVED llm settings.
+
+    Inheritance: empty classifier.base_url/api_key_env fall back to the llm
+    section's resolved values (same provider, same key); 0-valued timeout and
+    retries inherit as well. Returns a flat dict; "model" may stay "" which
+    callers treat as "classifier not configured".
+    """
+    section = config.get("classifier")
+    if not isinstance(section, dict):
+        section = {}
+    merged = dict(CLASSIFIER_DEFAULTS)
+    merged.update({k: v for k, v in section.items() if v not in (None, "")})
+
+    try:
+        workers = max(1, int(merged["workers"]))
+        queue_size = max(1, int(merged["queue"]))
+        timeout = int(merged["request_timeout_seconds"]) or llm["timeout"]
+        retries = int(merged["retries"]) or llm["retries"]
+        max_tokens = int(merged["max_tokens"] or 0)
+    except (TypeError, ValueError):
+        raise ConfigError("classifier numeric settings must be integers")
+
+    temperature = merged["temperature"]
+    if temperature is not None:
+        try:
+            temperature = float(temperature)
+        except (TypeError, ValueError):
+            raise ConfigError("classifier.temperature must be a number or null")
+
+    api_key = ""
+    if merged["api_key_env"]:
+        api_key = os.environ.get(merged["api_key_env"], "")
+    if not api_key:
+        api_key = llm["api_key"]
+
+    return {
+        "model": str(merged["model"]),
+        "base_url": (merged["base_url"] or llm["base_url"]).rstrip("/"),
+        "api_key": api_key,
+        "workers": workers,
+        "queue": queue_size,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "timeout": max(30, timeout),
+        "retries": max(0, retries),
+    }

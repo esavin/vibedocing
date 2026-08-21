@@ -19,6 +19,9 @@
 # decided SKIP cost no agent calls. With --doc-hints, commits the prior run DOCUMENTED
 # get a reconsideration round: a NO_DOC finish is held back while the prior run's
 # actual doc content is fed back to the agent for one re-examination.
+# Alternatively --classifier starts a PARALLEL pre-classifier (a cheap model, config
+# section `classifier`) that pre-decides DOCUMENT vs SKIP a few commits ahead; SKIP
+# commits then never reach the full agent. The two modes are mutually exclusive.
 #
 # Auto-commit: when the agent changes docs, this script commits them to the workspace git
 # repo (the project folder and this tooling folder are gitignored). One commit per
@@ -251,6 +254,7 @@ free_tree() { # <path>
 
 # ---- cleanup on exit / interrupt: free any in-flight worktree, prune ----
 cleanup() {
+  stop_classifier 2>/dev/null || true
   if [ -n "${CUR_TREE:-}" ]; then free_tree "$CUR_TREE" 2>/dev/null || true; CUR_TREE=""; fi
   [ -n "${SOURCE_DIR:-}" ] && git -C "$SOURCE_DIR" worktree prune 2>/dev/null || true
 }
@@ -264,6 +268,59 @@ regex_skips() { # <sha> <subject>
   [ -n "$SKIP_REGEX" ] || return 1
   [[ "$2" =~ $SKIP_REGEX ]] || return 1
   g rev-parse --verify --quiet "$1^" >/dev/null 2>&1 || return 0  # root commit: no R/D
+  ! g diff --name-status -M "$1^" "$1" | grep -qE '^[RD]'
+}
+
+# ---- parallel pre-classifier (--classifier) ----
+# A cheap model pre-decides DOCUMENT vs SKIP in parallel ahead of this loop;
+# SKIP commits never reach the full agent. The classifier process polls
+# progress.idx (this loop's consumed count) and stays at most `queue`
+# potential-DOCUMENT commits ahead, so an interrupted run loses almost nothing.
+CLASSIFIER_PID=""
+declare -A SHA_IDX   # sha -> index in the classifier's shas file
+start_classifier() {
+  local s i=0
+  CLS_DIR="$PIPELINE_DIR/classifier"; CLS_VERDICTS="$CLS_DIR/verdicts"
+  rm -rf "$CLS_DIR"; mkdir -p "$CLS_VERDICTS"
+  : > "$CLS_DIR/shas.txt"
+  for s in "${SHAS[@]}"; do
+    [[ -v PROC["$s"] ]] && continue     # already processed: not the classifier's business
+    printf '%s\n' "$s" >> "$CLS_DIR/shas.txt"
+    SHA_IDX["$s"]=$i; i=$((i+1))
+  done
+  if [ "$i" -eq 0 ]; then echo "classifier: nothing to classify" | tee -a "$WALK_LOG"; return 0; fi
+  printf '0' > "$CLS_DIR/progress.idx"
+  python3 -m vibe_agent.classifier --config "$CONFIG" --repo "$SOURCE_DIR" \
+    --shas "$CLS_DIR/shas.txt" --out "$CLS_VERDICTS" --progress "$CLS_DIR/progress.idx" \
+    --workers "$CLASSIFY_WORKERS" --queue "$CLASSIFY_QUEUE" \
+    > "$CLS_DIR/classifier.log" 2>&1 &
+  CLASSIFIER_PID=$!
+  echo "classifier: pid=$CLASSIFIER_PID model=$(jstr '.classifier.model') workers=$CLASSIFY_WORKERS queue=$CLASSIFY_QUEUE commits=$i" | tee -a "$WALK_LOG"
+}
+stop_classifier() {
+  if [ -n "$CLASSIFIER_PID" ]; then
+    kill "$CLASSIFIER_PID" 2>/dev/null || true
+    wait "$CLASSIFIER_PID" 2>/dev/null || true
+    CLASSIFIER_PID=""
+  fi
+}
+await_classifier() { # <sha> -> prints DOCUMENT|SKIP|ERROR; rc=1 if the classifier died without a verdict
+  [ -n "$CLASSIFIER_PID" ] || return 1
+  local f="$CLS_VERDICTS/$1.json"
+  while :; do
+    if [ -s "$f" ]; then
+      jq -r '.verdict // "ERROR"' "$f" 2>/dev/null || echo ERROR
+      return 0
+    fi
+    kill -0 "$CLASSIFIER_PID" 2>/dev/null || return 1
+    sleep 1
+  done
+}
+# A classifier SKIP is honored only for plain non-root commits: the root commit
+# must be documented (initial snapshot), and R/D commits may carry paths that
+# existing docs cite (path hygiene) - those go to the agent, like regex skips.
+classifier_may_skip() { # <sha>
+  g rev-parse --verify --quiet "$1^" >/dev/null 2>&1 || return 1
   ! g diff --name-status -M "$1^" "$1" | grep -qE '^[RD]'
 }
 
@@ -296,6 +353,26 @@ run_one() { # <sha>
     sync_set_baseline "$sha"
     save_progress --arg b "$sha" '.processed += [$b] | .skipped += 1'
     return 0
+  fi
+
+  if [ -n "$CLASSIFIER_PID" ]; then
+    # pre-classifier verdict (--classifier): SKIP saves the whole agent run;
+    # DOCUMENT / ERROR / guard-failed commits fall through to the agent below
+    local cverdict=""
+    if ! cverdict="$(await_classifier "$sha")"; then
+      echo "[$short] classifier process died — continuing in sequential mode (see classifier/classifier.log)" | tee -a "$WALK_LOG"
+      CLASSIFIER_PID=""
+    elif [ "$cverdict" = SKIP ] && classifier_may_skip "$sha"; then
+      echo "[$short] SKIP (classifier)  $subject"
+      printf 'VERDICT: NO_DOC(classifier)\n' > "$VERDICTS/$sha.txt"
+      jq -n --arg s "$sha" --arg r "$(jq -r '.reason // ""' "$CLS_VERDICTS/$sha.json" 2>/dev/null)" \
+         '{sha:$s, verdict:"NO_DOC", reason:("pre-classifier: " + $r)}' > "$VERDICTS/$sha.json" 2>/dev/null || true
+      sync_set_baseline "$sha"
+      save_progress --arg b "$sha" '.processed += [$b] | .skipped += 1'
+      return 0
+    elif [ "$cverdict" = ERROR ]; then
+      echo "[$short] classifier ERROR — falling back to the full agent"
+    fi
   fi
 
   path="$(make_tree "$sha")"
@@ -376,6 +453,15 @@ Usage: run.sh [options]
                   ask for one reconsideration round before accepting NO_DOC.
                   Helps borderline DOCUMENT/SKIP decisions converge across
                   reruns instead of flip-flopping with sampling noise.
+  --classifier    Enable the parallel pre-classifier: a cheap model (config
+                  classifier.model, possibly from another provider) pre-decides
+                  DOCUMENT vs SKIP for upcoming commits in parallel
+                  (classifier.workers, default 3), staying at most
+                  classifier.queue (default 2) DOCUMENT commits ahead of this
+                  loop - an interrupted run loses almost no classification
+                  work. SKIP never reaches the full agent; DOCUMENT commits are
+                  processed by the agent as usual. Mutually exclusive with
+                  --reuse-verdicts.
   --in-place      Checkout each commit in the source clone instead of a worktree.
   --stop-on-fail  Halt on the first failed commit (default: record and continue).
   --no-commit     Do not git-commit doc changes this run (overrides config auto_commit).
@@ -385,7 +471,7 @@ EOF
 
 DO_LIST=0; RESET_BASE=0; LIMIT=0; RANGE=""; SINGLE=""; OVERRIDE_MODEL=""
 STOP_ON_FAIL=0; CLASSIFY_ONLY=0; VALIDATE=0; VALIDATE_REF=""
-REUSE_VERDICTS=""; SKIP_LIST=""; DOC_HINTS=0
+REUSE_VERDICTS=""; SKIP_LIST=""; DOC_HINTS=0; USE_CLASSIFIER=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --list) DO_LIST=1;;
@@ -399,6 +485,7 @@ while [ $# -gt 0 ]; do
     --reuse-verdicts) REUSE_VERDICTS="${2:?--reuse-verdicts needs DIR}"; shift;;
     --skip-list) SKIP_LIST="${2:?--skip-list needs FILE}"; shift;;
     --doc-hints) DOC_HINTS=1;;
+    --classifier) USE_CLASSIFIER=1;;
     --in-place) USE_WORKTREE=false;;
     --stop-on-fail) STOP_ON_FAIL=1;;
     --no-commit) AUTO_COMMIT=false;;
@@ -435,6 +522,17 @@ fi
 # fail fast on an obviously missing model config (env VIBE_MODEL overrides)
 [ -n "${OVERRIDE_MODEL:-}" ] || [ -n "$CFG_MODEL" ] || \
   die "no model configured: set llm.model in config.json or export VIBE_MODEL"
+
+# ---- parallel pre-classifier mode (--classifier) ----
+# Mutually exclusive with --reuse-verdicts: either replay recorded NO_DOC
+# verdicts, or pre-classify fresh with a (cheaper) model, or neither.
+CLASSIFY_WORKERS=3; CLASSIFY_QUEUE=2
+if [ "$USE_CLASSIFIER" = 1 ]; then
+  [ -z "$REUSE_VERDICTS" ] || die "--classifier and --reuse-verdicts are mutually exclusive: replay recorded NO_DOC verdicts OR pre-classify fresh, not both"
+  [ -n "$(jstr '.classifier.model')" ] || die "--classifier requires classifier.model in config.json (a cheap model is enough; same provider as llm by default)"
+  CLASSIFY_WORKERS="$(jstr '.classifier.workers // 3')"
+  CLASSIFY_QUEUE="$(jstr '.classifier.queue // 2')"
+fi
 
 load_known_skips
 
@@ -497,14 +595,20 @@ fi
 
 {
   echo "=== vibe-walk started $(date -Iseconds) ==="
-  echo "project=$PROJECT source=$SOURCE_REL branch=$BRANCH commits=${#SHAS[@]} worktree=$USE_WORKTREE classify=$CLASSIFY_ONLY commit=$AUTO_COMMIT model=${OVERRIDE_MODEL:-$CFG_MODEL} preseeded=$PRESEEDED_N doc_hints=$([ "$DOC_HINTS" = 1 ] && echo "$PRIOR_DOC_N" || echo 0)"
+  echo "project=$PROJECT source=$SOURCE_REL branch=$BRANCH commits=${#SHAS[@]} worktree=$USE_WORKTREE classify=$CLASSIFY_ONLY commit=$AUTO_COMMIT model=${OVERRIDE_MODEL:-$CFG_MODEL} preseeded=$PRESEEDED_N doc_hints=$([ "$DOC_HINTS" = 1 ] && echo "$PRIOR_DOC_N" || echo 0) classifier=$([ "$USE_CLASSIFIER" = 1 ] && echo "on(workers=$CLASSIFY_WORKERS,queue=$CLASSIFY_QUEUE)" || echo off)"
 } | tee -a "$WALK_LOG"
+
+[ "$USE_CLASSIFIER" = 1 ] && start_classifier
 
 count=0; last_short=""
 for sha in "${SHAS[@]}"; do
   [[ -v PROC["$sha"] ]] && continue
   [ "$LIMIT" -gt 0 ] && [ "$count" -ge "$LIMIT" ] && { echo "Reached --limit $LIMIT; stopping." | tee -a "$WALK_LOG"; break; }
   count=$((count+1)); last_short="${SHORT[$sha]:-??????????}"
+  # tell the pre-classifier how far this loop has consumed its shas list
+  if [ -n "$CLASSIFIER_PID" ] && [[ -v SHA_IDX["$sha"] ]]; then
+    printf '%d' "$(( SHA_IDX["$sha"] + 1 ))" > "$CLS_DIR/progress.idx"
+  fi
   run_one "$sha" 2>&1 | tee -a "$WALK_LOG"
 done
 

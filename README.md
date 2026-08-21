@@ -120,6 +120,32 @@ DOC_UPDATED commits are re-processed normally (the docs map is rebuilt from
 scratch). `--skip-list FILE` force-skips specific commits (one hash per line,
 `#` comments) — handy to override commits a previous run documented.
 
+## Parallel pre-classification (--classifier)
+
+Instead of replaying old verdicts, a **cheap model** can pre-decide
+DOCUMENT vs SKIP for upcoming commits **in parallel** ahead of the main loop,
+so the expensive agent only runs for commits worth documenting:
+
+```bash
+$EDITOR vibedocing/config.json   # classifier.model = e.g. "qwen3.6-35b-a3b"
+./vibedocing/run.sh --classifier
+```
+
+- The classifier has its own lean system prompt (no tools, one request per
+  commit, the full diff pre-injected) and never touches a worktree or the
+  docs map — it only reads git plumbing from the source repo.
+- `classifier.workers` (default 3) parallel requests;
+  `classifier.queue` (default 2) is how far ahead it may run: at most a
+  couple of DOCUMENT commits wait ahead of the main loop, so an interrupted
+  run loses almost no classification work.
+- Same provider by default; a different one is just
+  `classifier.base_url` + `classifier.api_key_env`.
+- Safety: root commits and commits that rename/move/delete files always go
+  to the full agent (path hygiene); a classifier ERROR falls back to the
+  agent too. `SKIP (classifier)` verdicts are recorded like other NO_DOCs.
+- Mutually exclusive with `--reuse-verdicts`: either replay recorded
+  verdicts, or pre-classify fresh, or neither.
+
 Borderline DOCUMENT/SKIP decisions can flip between runs (LLM sampling noise,
 different docs-map state). `--doc-hints` (with `--reuse-verdicts`) covers the
 expensive direction: when the agent finishes NO_DOC for a commit the prior run
@@ -140,6 +166,8 @@ visible in the verdict JSON (`"reconsidered": true`) and the transcript
 --sha S              process a single commit
 --reuse-verdicts D   replay NO_DOC verdicts from a previous run's verdicts dir
 --skip-list F        force-skip commits listed in F (one hash per line)
+--classifier         pre-decide DOCUMENT/SKIP in parallel with a cheap model
+                     (config classifier.*; incompatible with --reuse-verdicts)
 --doc-hints          on NO_DOC for a commit the prior run documented, re-ask the
                     agent once with the prior run's actual docs attached
 --in-place           checkout in the source clone instead of a worktree

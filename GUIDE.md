@@ -154,6 +154,20 @@ After every DOC_UPDATED verdict the docs map is validated mechanically (config
   round-trip with no `git show` call. Raise the cap on large-context models.
 - Re-running a project from scratch? `--reuse-verdicts` replays previous NO_DOC
   verdicts for free (see "Re-running from scratch").
+- **Parallel pre-classifier** (`--classifier`): a cheap model pre-decides DOCUMENT vs
+  SKIP ahead of the main loop, so the full agent runs only for DOCUMENT commits —
+  on skip-heavy histories most of the wall-clock (agent startup + LLM round-trips
+  per commit) disappears. Configure under `classifier` in config.json:
+  `model` (required to use the mode; same provider as `llm` unless you set
+  `base_url`/`api_key_env`), `workers` (parallel requests, default 3) and
+  `queue` (how many DOCUMENT verdicts may wait ahead of the main loop,
+  default 2 — small by design so an interrupt loses almost no classification
+  work; SKIP verdicts don't count against it, so workers stay busy on
+  fix-heavy stretches). Safety: root commits and commits with renames/deletes
+  always reach the agent (path hygiene), and a classifier ERROR falls back to
+  the agent. Runtime artifacts land in `vibedocing/classifier/`
+  (`classifier.log`, per-commit verdicts). Mutually exclusive with
+  `--reuse-verdicts`.
 - `--dry-run` validates classification cheaply before real writes.
 - `--limit N` bounds a run; combine with automatic resume for overnight batches.
 - Each agent call is a fresh short-lived process — there is no server to keep warm.

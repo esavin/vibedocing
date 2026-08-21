@@ -10,6 +10,9 @@
 /logs/
 /verdicts/
 
+# Parallel pre-classifier runtime dir (run.sh --classifier).
+/classifier/
+
 # Disposable git worktrees created by the walker.
 /.vibe-trees/
 
