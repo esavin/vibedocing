@@ -58,11 +58,13 @@ mywork/                         <- workspace (its own git repo)
 
 1. `run.sh` checks the commit out into a disposable git worktree (stateful replay).
 2. `python3 -m vibe_agent` — fresh session — injects the commit metadata, a
-   rename-aware name-status (renames/deletions first), a precomputed list of docs
+   rename-aware name-status (renames/deletions first), the full diff whenever
+   it fits a size cap (`limits.diff_chars`) so most SKIP verdicts classify in
+   one round-trip, a precomputed list of docs
    still citing paths renamed/deleted by this commit, a one-line-per-doc overview
    of the current docs map (so the agent never re-reads it to decide NEW vs
    UPDATE), and project conventions into a compact system+user prompt, then
-   classifies DOCUMENT vs SKIP from the actual diff and the historical tree via
+   classifies DOCUMENT or SKIP from the actual diff and the historical tree via
    six guarded tools (git/read_file/list_dir/search_docs/write_doc/finish).
    Root commits (giant initial snapshots) get a dedicated mode: a real tree
    digest instead of the diffstat and a bigger step budget. On small-context

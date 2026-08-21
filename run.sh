@@ -256,6 +256,17 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# ---- commit_skip_regex gate ----
+# A subject matching commit_skip_regex is force-skipped ONLY when the commit
+# renames/moves/deletes nothing: an R/D commit may carry paths that existing
+# docs cite (path hygiene) and must still reach the agent.
+regex_skips() { # <sha> <subject>
+  [ -n "$SKIP_REGEX" ] || return 1
+  [[ "$2" =~ $SKIP_REGEX ]] || return 1
+  g rev-parse --verify --quiet "$1^" >/dev/null 2>&1 || return 0  # root commit: no R/D
+  ! g diff --name-status -M "$1^" "$1" | grep -qE '^[RD]'
+}
+
 # ---- run one commit ----
 run_one() { # <sha>
   local sha="$1" short subject path args verdict rc kind extra="" parent=""
@@ -279,7 +290,7 @@ run_one() { # <sha>
     return 0
   fi
 
-  if [ -n "$SKIP_REGEX" ] && [[ $subject =~ $SKIP_REGEX ]]; then
+  if regex_skips "$sha" "$subject"; then
     echo "[$short] SKIP (regex)  $subject"
     printf 'VERDICT: NO_DOC(regex)\n' > "$VERDICTS/$sha.txt"
     sync_set_baseline "$sha"
@@ -475,7 +486,7 @@ if [ "$DO_LIST" = 1 ]; then
     subj="${SUBJ[$sha]:-?}"; short="${SHORT[$sha]:-??????????}"
     if [[ -v PROC["$sha"] ]]; then dec="DONE"; d=$((d+1))
     elif [[ -v CACHED_SKIP["$sha"] ]]; then dec="SKIP*"; ps=$((ps+1))
-    elif [ -n "$SKIP_REGEX" ] && [[ $subj =~ $SKIP_REGEX ]]; then dec="SKIP"; s=$((s+1))
+    elif regex_skips "$sha" "$subj"; then dec="SKIP"; s=$((s+1))
     else dec="PROCESS"; p=$((p+1)); fi
     printf '%-12s %-8s %s\n' "$short" "$dec" "$subj"
   done

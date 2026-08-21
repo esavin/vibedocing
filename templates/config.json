@@ -11,8 +11,7 @@
   "use_worktree": true,
   "skip_merges": true,
 
-  "commit_skip_regex": "^(fix|chore|style|test|docs|refactor|perf|build|ci|revert|bump|format|lint|typo)(\\(|:)",
-
+  "commit_skip_regex": "@@SKIP_REGEX@@",
   "scope": "",
 
   "limits": {
@@ -23,6 +22,7 @@
     "read_file_chars": 80000,
     "list_dir_chars": 40000,
     "diffstat_chars": 30000,
+    "diff_chars": 16000,
     "name_status_chars": 20000,
     "tree_digest_chars": 8000,
     "conventions_chars": 12000,

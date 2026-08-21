@@ -21,6 +21,9 @@ and updates the documentation map only when warranted. You see exactly one commi
 - COMMIT metadata: sha, subject, full message, diffstat.
 - NAME STATUS: per-file change list (A/M/D/R) against the parent commit. Renames (R) \
 show old -> new paths; deletions (D) show the removed path.
+- FULL DIFF (when present): the complete rename-aware diff of this commit. When \
+present, the whole change is already in front of you - do NOT re-fetch it with \
+`git show`; read worktree files only when you need surrounding context.
 - STALE DOC REFERENCES (when present): docs that cite paths renamed/deleted by THIS \
 commit. This is your mandatory repair worklist.
 - INITIAL SNAPSHOT (root commits only): replaces the diffstat with a TREE DIGEST of \
@@ -49,9 +52,12 @@ Never prefix paths with a workspace folder name, and never cite a path you have 
 seen in the worktree.
 
 # Workflow
-1. Inspect the commit with the git tool: `git show --stat <sha>`, then \
-`git show -M <sha> -- <path>` for significant paths (use -M so renames are followed). \
-Read affected source files from the WORKTREE as they exist at this commit.
+1. If FULL DIFF is present in the first user message, classify directly from it - \
+do not call git show for the commit (read worktree files only when you need \
+surrounding context). Otherwise inspect the commit with the git tool: \
+`git show --stat <sha>`, then `git show -M <sha> -- <path>` for significant paths \
+(use -M so renames are followed). Read affected source files from the WORKTREE \
+as they exist at this commit.
 2. Classify DOCUMENT vs SKIP (rules below). Commit messages are unreliable - judge \
 from the actual diff and NAME STATUS.
 3. If DOCUMENT and MODE is "document": update the docs idempotently (rules below). \
@@ -536,6 +542,20 @@ def build_first_user(sha, worktree, docs_root, mode, today, conventions,
         sections.append("DIFFSTAT (git show --stat):\n%s"
                         % _cap("\n".join(stat.splitlines()[:300]),
                                int(lim.get("diffstat_chars") or 30000)) or "(empty)")
+
+        # FULL DIFF: when the complete change fits the cap, inject it so the
+        # agent can classify without a git-show round-trip (most SKIP verdicts
+        # become a single request). Injected only whole - a truncated diff
+        # would look complete but is not. 0 disables.
+        diff_cap = int(lim.get("diff_chars") or 0)
+        if diff_cap > 0 and parent:
+            diff = _git_ok(worktree, ["diff", "-M", parent, sha]).strip("\n")
+            if diff and len(diff) <= diff_cap:
+                sections.append(
+                    "FULL DIFF (git diff -M parent..commit - the COMPLETE change, "
+                    "nothing truncated; classify from it directly, no need to "
+                    "re-fetch with git show):\n%s" % diff
+                )
 
     if old_paths:
         stale = stale_doc_references(docs_root, old_paths)

@@ -64,6 +64,23 @@ detect_lang() {
 }
 detect_lang
 
+# ---- commit_skip_regex: detect the project's commit-message style ----
+# Conventional-commit prefixes ("fix:", "chore(", ...) get the historical
+# prefix regex; everything else (plain subjects like "NPE fixed") gets a
+# word-boundary fix/cleanup/typo matcher. Either way run.sh only force-skips
+# commits that rename/move/delete nothing (path hygiene still reaches the agent).
+CONVENTIONAL_ERE='^(fix|chore|style|test|docs|refactor|perf|build|ci|revert|bump|format|lint|typo)(\(|:)'
+WORD_ERE='(^|[^A-Za-z])([Ff]ixed|[Ff]ix(es)?|[Bb]ugfix(ing|es)?|[Tt]ypos?|[Cc]lean[- ]?[Uu]ps?|[Mm]inor|[Cc]osmetic|[Cc]orrected|[Ss]uppressed)([^A-Za-z]|$)'
+sample_subjects="$(git -C "$PROJECT_DIR" log --format=%s -n 300 --no-merges 2>/dev/null || true)"
+if [ -n "$sample_subjects" ] \
+   && [ "$(printf '%s\n' "$sample_subjects" | grep -cE "$CONVENTIONAL_ERE")" -ge 30 ]; then
+  SKIP_ERE="$CONVENTIONAL_ERE"; SKIP_STYLE="conventional-commit prefixes"
+else
+  SKIP_ERE="$WORD_ERE"; SKIP_STYLE="fix/cleanup words in the subject"
+fi
+# escape backslashes for embedding in the JSON template value
+# (final value is written with jq below - bash substitution would eat them)
+
 # ---- render helper (bash substitution — no sed escaping issues) ----
 render() { # <infile> <outfile>
   local content; content="$(cat "$1")"
@@ -80,6 +97,7 @@ echo ">> workspace:   $WORK_DIR"
 echo ">> project:     $PROJECT_NAME  ($PROJECT_DIR)"
 echo ">> source_root: $SOURCE_REL"
 echo ">> branch:      $BRANCH   language: $LANGUAGE ($LAYOUT)"
+echo ">> skip regex:  $SKIP_STYLE"
 
 # ---- 1. .gitignore ----
 {
@@ -125,6 +143,11 @@ fi
 
 # ---- 4. config.json ----
 render "$TPL/config.json" "$PIPELINE_DIR/config.json"
+# commit_skip_regex carries regex backslashes; write it with jq so the JSON
+# escaping is always correct (bash substitution would mangle \\ sequences).
+jq --arg rx "$SKIP_ERE" '.commit_skip_regex = $rx' \
+  "$PIPELINE_DIR/config.json" > "$PIPELINE_DIR/config.json.tmp" \
+  && mv "$PIPELINE_DIR/config.json.tmp" "$PIPELINE_DIR/config.json"
 echo ">> wrote vibedocing/config.json"
 
 # ---- 5. agent runtime sanity + LLM setup hints ----

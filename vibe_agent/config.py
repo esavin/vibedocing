@@ -33,6 +33,9 @@ LIMIT_DEFAULTS = {
     "list_dir_chars": 40_000,
     # first-user-message injection caps (prompt.py)
     "diffstat_chars": 30_000,
+    # full-diff injection into the first user message: the diff is injected
+    # only when it fits this cap WHOLE (never truncated); 0 disables
+    "diff_chars": 16_000,
     "name_status_chars": 20_000,
     "tree_digest_chars": 8_000,
     "conventions_chars": 12_000,
@@ -56,6 +59,7 @@ LIMIT_PROFILES = {
         "read_file_chars": 24_000,
         "list_dir_chars": 16_000,
         "diffstat_chars": 10_000,
+        "diff_chars": 12_000,
         "name_status_chars": 8_000,
         "tree_digest_chars": 6_000,
         "conventions_chars": 8_000,

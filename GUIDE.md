@@ -141,13 +141,25 @@ After every DOC_UPDATED verdict the docs map is validated mechanically (config
 
 ## Performance / cost
 - Tune `commit_skip_regex` with `--list` first — a good filter avoids most agent calls.
+  `bootstrap.sh` picks the pattern from the project's history: conventional-commit
+  prefixes (`fix:`, `chore(`, …) when ≥10% of recent subjects use them, otherwise a
+  word matcher. For projects without conventional-commit prefixes, match fix-like words
+  anywhere in the subject (e.g. `(^|[^A-Za-z])([Ff]ixed|[Ff]ix(es)?|[Tt]ypos?|[Cc]lean[- ]?[Uu]ps?|[Mm]inor|[Cc]osmetic|[Cc]orrected)([^A-Za-z]|$)`).
+  Safety net: a matching commit is still PROCESSED when it renames/moves/deletes
+  anything (R/D in `git diff --name-status -M`) — such commits may carry paths that
+  existing docs cite (path hygiene), which the subject alone cannot reveal.
+- The first user message includes the **FULL DIFF** (`limits.diff_chars`, default
+  16k chars, 12k in the `small` profile) whenever the complete change fits the cap —
+  injected whole or not at all. Most SKIP verdicts then classify in a single
+  round-trip with no `git show` call. Raise the cap on large-context models.
 - Re-running a project from scratch? `--reuse-verdicts` replays previous NO_DOC
   verdicts for free (see "Re-running from scratch").
 - `--dry-run` validates classification cheaply before real writes.
 - `--limit N` bounds a run; combine with automatic resume for overnight batches.
 - Each agent call is a fresh short-lived process — there is no server to keep warm.
   A cheap/smaller model is often enough: the system prompt is ~1K tokens and the commit
-  metadata + diffstat are pre-injected, so most SKIP verdicts cost a single round-trip.
+  metadata + diffstat (and, when it fits, the full diff) are pre-injected, so most
+  SKIP verdicts cost a single round-trip.
 - Small-context (~32k) models: set `"limits": {"profile": "small"}` in config.json.
   The profile bundles tighter caps on every injected blob (diffstat, name-status,
   conventions, per-tool-result) **and enables history compaction**: normally the whole
