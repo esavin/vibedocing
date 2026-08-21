@@ -13,15 +13,21 @@ the model:
   every processed commit the pipeline now re-adds a link entry for every
   functions/ or design/ doc the hub no longer lists and drops entries pointing
   to docs that no longer exist.
+- dropped navigation sections: an agent rewrite of the hub can delete a whole
+  section heading (a real run lost "## Function Documentation" in the root
+  commit and every later capability doc then landed in design/). The
+  reconciliation now re-creates a missing section from the canonical template
+  (## Function Documentation / ## Technical Design Documents), anchored above
+  the Sync Status section, with either the orphaned links or the template
+  "_(none yet)_" placeholder.
 
     python3 -m vibe_agent.hub --docs-root agent/project --baseline <sha> \
         --label "<short sha> (<subject>)" --date YYYY-MM-DD
 
 Idempotent: rewrites the marker bullets in place; the navigation pass is a
-no-op when the hub already covers every doc. Section headings are located by
-the "function" / "design" substrings (## Function Documentation, ## Technical
-Design Documents); without a matching heading there is nothing to anchor new
-entries to, and the pass reports the orphans instead of guessing structure.
+no-op when the hub already covers every doc and keeps both sections. Section
+headings are located by the "function" / "design" substrings (## Function
+Documentation, ## Technical Design Documents).
 """
 
 import argparse
@@ -29,18 +35,27 @@ import os
 import re
 import sys
 
-from .validate import _LINK_RE, _SKIP_PREFIXES, DOCS_TOP_DIRS
+from .validate import (_HEADING_RE, _LINK_RE, _SKIP_PREFIXES, DOCS_TOP_DIRS,
+                       NAV_SECTION_KEYS)
 
 HUB = "PROJECT.md"
 _BASELINE_RE = re.compile(r"^(\s*-\s*\*\*[Bb]aseline commit:\*\*.*)$")
 _SYNCED_RE = re.compile(r"^(\s*-\s*\*\*[Ll]ast synced:\*\*.*)$")
+_SYNC_HEADING_RE = re.compile(r"^#{1,6}\s+sync\s+status\s*$", re.IGNORECASE)
 
-# navigation sections are located by a substring of their heading text
-_NAV_SECTIONS = (
-    ("function", "functions"),
-    ("design", "design"),
-)
-_HEADING_RE = re.compile(r"^#{1,6}\s+(.*)$")
+# canonical section blocks, kept in sync with templates/PROJECT.md; used to
+# re-create a navigation section the agent dropped from the hub entirely
+_SECTION_HEADING = {
+    "functions": "## Function Documentation",
+    "design": "## Technical Design Documents",
+}
+_SECTION_COMMENT = {
+    "functions": "<!-- Links to `functions/<number>-<name>.md` are added here "
+                 "as functions are documented. -->",
+    "design": "<!-- Links to `design/<number>-<name>.md` are added here as "
+              "designs are documented. -->",
+}
+_SECTION_PLACEHOLDER = "_(none yet)_"
 _HR_RE = re.compile(r"^-{3,}\s*$")
 _PLACEHOLDER_RE = re.compile(r"^_\(.*\)_$|^_To be populated\._$")
 
@@ -116,8 +131,11 @@ def _link_targets(line, docs_root):
 def reconcile_navigation(docs_root):
     """Guarantee navigation coverage of the hub: add a link entry for every
     functions/ or design/ doc not linked anywhere in PROJECT.md (entry text =
-    the doc's first heading), drop entries whose target doc no longer exists.
-    Returns a one-line change summary, '' when the hub is already complete."""
+    the doc's first heading), drop entries whose target doc no longer exists,
+    and re-create a navigation section whose heading was dropped entirely
+    (anchored above Sync Status, holding the orphaned links or the template
+    placeholder). Returns a one-line change summary, '' when the hub is
+    already complete."""
     lines = _read_lines(os.path.join(docs_root, HUB))
     if lines is None:
         return ""
@@ -142,7 +160,7 @@ def reconcile_navigation(docs_root):
         if heading:
             text = heading.group(1).lower()
             current = None
-            for key, directory in _NAV_SECTIONS:
+            for key, directory in NAV_SECTION_KEYS:
                 if key in text:
                     current = directory
                     break
@@ -171,9 +189,6 @@ def reconcile_navigation(docs_root):
         elif line.strip():
             insert_at[directory] = len(out)
 
-    unresolved = [d for d, docs in missing.items()
-                  if docs and d not in insert_at]
-    orphan_left = sum(len(missing[d]) for d in unresolved)
     blocks = []
     for directory, docs in missing.items():
         if not docs or directory not in insert_at:
@@ -186,21 +201,66 @@ def reconcile_navigation(docs_root):
             block.append("- [%s](%s)" % (title, t))
         blocks.append((insert_at[directory], block))
         added += len(block)
+
+    # a directory whose section heading is missing entirely gets a canonical
+    # section re-created (template order: functions, then design), anchored
+    # right above the Sync Status section so new docs always have an anchor
+    created = []
+    sync_anchor = len(out)
+    for index, line in enumerate(out):
+        if _SYNC_HEADING_RE.match(line):
+            sync_anchor = index
+            back = sync_anchor
+            while back > 0 and not out[back - 1].strip():
+                back -= 1
+            if back > 0 and _HR_RE.match(out[back - 1]):
+                sync_anchor = back - 1  # keep a new section above the --- rule
+            break
+    else:
+        if out and out[-1].strip():
+            out.append("")  # separate appended sections from the last line
+            sync_anchor = len(out)
+    for rank, (_key, directory) in enumerate(NAV_SECTION_KEYS):
+        if directory in insert_at:
+            continue  # section heading present - entries anchor inside it
+        block = [_SECTION_HEADING[directory], _SECTION_COMMENT[directory]]
+        for t in missing[directory]:
+            name = t.split("/", 1)[1]
+            title = _doc_title(os.path.join(docs_root, t),
+                               os.path.splitext(name)[0])
+            block.append("- [%s](%s)" % (title, t))
+        if missing[directory]:
+            added += len(missing[directory])
+        else:
+            block.append(_SECTION_PLACEHOLDER)
+        block.append("")  # blank line before whatever follows the section
+        created.append(directory)
+        # +rank keeps template order when both sections are created at the
+        # same anchor: blocks insert highest-first, so design lands above the
+        # anchor first and functions ends up before it
+        blocks.append((sync_anchor + rank, block))
+
+    unresolved = [d for d, docs in missing.items()
+                  if docs and d not in insert_at and d not in created]
+    orphan_left = sum(len(missing[d]) for d in unresolved)
     # insert highest anchor first so earlier anchors keep their indices
     for index, block in sorted(blocks, key=lambda b: b[0], reverse=True):
         out[index:index] = block
 
-    if not (added or dropped):
+    if not (added or dropped or created):
         if orphan_left:
             return ("navigation: %d orphan doc(s) left - no matching section "
                     "heading to anchor entries" % orphan_left)
         return ""
     with open(os.path.join(docs_root, HUB), "w", encoding="utf-8") as fh:
         fh.write("\n".join(out) + "\n")
-    return "navigation: %+d link(s), -%d dead link(s)%s" % (
-        added, dropped,
-        (" (%d orphan doc(s) left - no matching section heading)" % orphan_left)
-        if orphan_left else "")
+    summary = "navigation: %+d link(s), -%d dead link(s)" % (added, dropped)
+    if created:
+        summary += ", created section(s): %s" % "/".join(created)
+    if orphan_left:
+        summary += (" (%d orphan doc(s) left - no matching section heading)"
+                    % orphan_left)
+    return summary
 
 
 def main(argv=None):

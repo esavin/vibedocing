@@ -122,7 +122,9 @@ After every DOC_UPDATED verdict the docs map is validated mechanically (config
   directory; all relative markdown links resolve; path-shaped references resolve in
   the worktree; nothing cites paths renamed/deleted by this commit; every
   functions/design doc is linked from PROJECT.md (warning-level orphan check —
-  see the hub reconciliation below);
+  see the hub reconciliation below); PROJECT.md keeps BOTH navigation sections
+  (`## Function Documentation` / `## Technical Design Documents`) — a dropped
+  section is an error and the hub pass re-creates it;
 - problems go back to the agent for up to `validation.rounds` repair rounds; each
   repair round **extends the step budget by 6 steps** (validation feedback must
   never eat the steps the model needs to fix and re-finish), and in the last two

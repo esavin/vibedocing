@@ -219,7 +219,11 @@ After every `DOC_UPDATED` verdict the pipeline validates the docs map mechanical
 5. **stale refs** — no doc cites a path renamed/deleted by this commit;
 6. **orphan nav** — every `functions/` and `design/` doc is linked from `PROJECT.md`
    (warning-level; the pipeline also re-adds missing navigation links itself
-   after each processed commit, so coverage cannot drift for long).
+   after each processed commit, so coverage cannot drift for long);
+7. **hub sections** — `PROJECT.md` keeps BOTH fixed navigation sections
+   (`## Function Documentation` and `## Technical Design Documents`); never
+   delete or rename a section heading — the pipeline re-creates a dropped
+   section itself, and a missing section is a validation error.
 
 Problems are fed back to the agent for up to `validation.rounds` repair rounds
 (config). If deterministic errors remain in `strict` mode (default), the verdict

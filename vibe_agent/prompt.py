@@ -59,8 +59,9 @@ If MODE is "classify-only": do the same analysis, write nothing, and report the 
 you WOULD have produced.
 4. Always end by calling the finish tool exactly once. After you finish, an automated \
 validator checks what you wrote (doc-internal links, unique doc numbering, fixed docs \
-layout, that cited repo paths exist in the worktree, and that no doc still cites a \
-path renamed/deleted by this commit). If it reports problems you will get one repair \
+layout, that cited repo paths exist in the worktree, that no doc still cites a \
+path renamed/deleted by this commit, and that PROJECT.md keeps BOTH navigation \
+sections). If it reports problems you will get one repair \
 round: fix ONLY the listed problems with write_doc, then IMMEDIATELY call finish \
 again - do not re-read files, re-verify, or explore anything else first. Also: \
 read_file/list_dir paths are absolute or relative to the WORKTREE or DOCS ROOT \
@@ -118,8 +119,10 @@ write_doc {"path": ..., "delete": true}).
 2. Create/update function and/or design docs using the templates below. Cite source \
 files as repository-root-relative paths, exactly as they exist in the worktree.
 3. Update PROJECT.md navigation for any new doc; refresh the module/package map if a \
-new module appeared. Do NOT fill the Sync Status section yourself - the pipeline \
-maintains it automatically.
+new module appeared. PROJECT.md MUST always keep BOTH fixed navigation sections - \
+"## Function Documentation" and "## Technical Design Documents" - never delete or \
+rename a section heading, and never fold one level into the other. Do NOT fill the \
+Sync Status section yourself - the pipeline maintains it automatically.
 4. In every file you modify: set *Last updated: <TODAY>* and *Areas: ...* per the \
 conventions file.
 5. Touch only docs that correspond to real changes in THIS commit (plus stale-path \
@@ -435,40 +438,52 @@ def docs_numbering(docs_root):
 
 
 def docs_overview(docs_root, max_chars=6000, max_entries=80):
-    """One line per existing doc (path + title from its first heading).
+    """One line per existing doc (path + title from its first heading), plus a
+    visible "(no docs yet)" marker for each EMPTY top-level directory.
 
     Mechanically rebuilt from disk for every commit - like docs_numbering -
     so it can never go stale. Injecting it into the first user message lets
     the agent decide NEW vs UPDATE without spending read_file steps
     re-discovering the map (Problem 2 of the perf report: per-commit
-    re-reading of PROJECT.md and the doc list).
+    re-reading of PROJECT.md and the doc list). The empty-dir markers keep
+    the functions/design LEVELS visible even when one of them has no docs
+    yet - otherwise the agent sees a design-only map and files every new
+    capability doc under design/ (a real run lost the whole functions level
+    that way).
     """
     from vibe_agent.validate import DOCS_TOP_DIRS
-    candidates = []
-    hub = os.path.join(docs_root, "PROJECT.md")
-    if os.path.isfile(hub):
-        candidates.append(("PROJECT.md", hub))
-    for directory in sorted(DOCS_TOP_DIRS):
-        dpath = os.path.join(docs_root, directory)
-        if not os.path.isdir(dpath):
-            continue
-        for name in sorted(os.listdir(dpath)):
-            if name.startswith(".") or not name.lower().endswith(".md"):
-                continue
-            candidates.append(("%s/%s" % (directory, name),
-                               os.path.join(dpath, name)))
-    rows = []
-    for rel, path in candidates:
-        title = ""
+
+    def first_title(path):
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as fh:
                 for line in fh.read(4000).splitlines():
                     if line.startswith("# "):
-                        title = line[2:].strip()
-                        break
+                        return line[2:].strip()
         except OSError:
             pass
-        rows.append("- %s - %s" % (rel, title or "(untitled)"))
+        return ""
+
+    rows = []
+    hub = os.path.join(docs_root, "PROJECT.md")
+    if os.path.isfile(hub):
+        rows.append("- PROJECT.md - %s" % (first_title(hub) or "(untitled)"))
+    for directory in sorted(DOCS_TOP_DIRS):
+        dpath = os.path.join(docs_root, directory)
+        names = []
+        if os.path.isdir(dpath):
+            names = [name for name in sorted(os.listdir(dpath))
+                     if not name.startswith(".")
+                     and name.lower().endswith(".md")]
+        if names:
+            for name in names:
+                rel = "%s/%s" % (directory, name)
+                rows.append("- %s - %s"
+                            % (rel, first_title(os.path.join(dpath, name))
+                               or "(untitled)"))
+        else:
+            hint = (" - new user-facing capability docs belong here"
+                    if directory == "functions" else "")
+            rows.append("- %s/ - (no docs yet%s)" % (directory, hint))
     if not rows:
         return ""
     more = ""
@@ -542,10 +557,11 @@ def build_first_user(sha, worktree, docs_root, mode, today, conventions,
                              int(lim.get("docs_overview_chars") or 6000))
     if overview:
         sections.append(
-            "DOCS MAP OVERVIEW (every existing doc with its title - decide "
-            "NEW vs UPDATE from this list; read a specific doc ONLY if you "
-            "will edit it, and never create a second doc for a topic already "
-            "listed here):\n%s" % overview
+            "DOCS MAP OVERVIEW (every existing doc with its title - functions/ "
+            "docs describe user-facing capabilities, design/ docs the technical "
+            "how; decide NEW vs UPDATE from this list; read a specific doc ONLY "
+            "if you will edit it, and never create a second doc for a topic "
+            "already listed here):\n%s" % overview
         )
 
     if not conventions:

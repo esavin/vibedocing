@@ -26,6 +26,13 @@ Checks:
               pipeline's hub reconciliation (vibe_agent/hub.py) re-adds missing
               links itself after each processed commit, so this is a drift
               signal, not a repair task for the agent.
+ 7. hub sections - PROJECT.md keeps BOTH fixed navigation sections (## Function
+              Documentation, ## Technical Design Documents). A dropped section
+              heading leaves every later doc of that level without an anchor
+              (a real run lost the functions section at the root commit and
+              all 255 documented commits then went to design/). Errors: the
+              heading is trivial to restore in a repair round, and hub.py
+              re-creates a missing section deterministically as a safety net.
 
 Severities: errors are deterministic and block publication in strict mode; warnings
 are heuristics recorded in the report. Usable standalone:
@@ -41,6 +48,12 @@ import sys
 
 DOCS_TOP_FILES = {"project.md", "update-documents.md", "project-conventions.md"}
 DOCS_TOP_DIRS = {"functions", "design"}
+
+_HEADING_RE = re.compile(r"^#{1,6}\s+(.*)$")
+# navigation sections of PROJECT.md are located by a substring of their heading
+# text - tolerates reasonable renames an agent might produce ("## Design Docs"
+# still anchors the design section)
+NAV_SECTION_KEYS = (("function", "functions"), ("design", "design"))
 
 # at least one "/" and plain filename characters only
 _PATH_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_.@/\-])[A-Za-z0-9_.\-]+(?:/[A-Za-z0-9_.\-]+)+")
@@ -233,6 +246,32 @@ def check_orphans(docs_root, warnings):
                     "commit)" % (directory, name))
 
 
+def check_hub_sections(docs_root, errors):
+    """PROJECT.md must keep BOTH fixed navigation sections (functions + design).
+    When the agent drops a section heading, every later doc of that level loses
+    its anchor and the level silently migrates into the surviving section, so
+    this is an error, not a warning."""
+    hub = os.path.join(docs_root, "PROJECT.md")
+    if not os.path.isfile(hub):
+        return
+    present = set()
+    for line in _read(hub).splitlines():
+        match = _HEADING_RE.match(line)
+        if not match:
+            continue
+        text = match.group(1).lower()
+        for key, directory in NAV_SECTION_KEYS:
+            if key in text:
+                present.add(directory)
+    for _key, directory in NAV_SECTION_KEYS:
+        if directory not in present:
+            errors.append(
+                "PROJECT.md: missing %s navigation section - restore its "
+                "heading ('## Function Documentation' / '## Technical Design "
+                "Documents'); docs in %s/ must be linked from there"
+                % (directory, directory))
+
+
 def validate_docs(docs_root, worktree=None, old_paths=(), path_check="error"):
     """Run all checks. Returns {"errors": [...], "warnings": [...]}."""
     errors, warnings = [], []
@@ -247,6 +286,7 @@ def validate_docs(docs_root, worktree=None, old_paths=(), path_check="error"):
         warnings.extend(path_problems)
     check_stale(docs_root, old_paths, errors)
     check_orphans(docs_root, warnings)
+    check_hub_sections(docs_root, errors)
     return {"errors": errors, "warnings": warnings}
 
 

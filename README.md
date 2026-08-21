@@ -73,17 +73,18 @@ mywork/                         <- workspace (its own git repo)
 3. If DOCUMENT: the agent edits `agent/project/` (function/design docs + PROJECT.md nav).
    Commits that rename/move/delete files cited in docs trigger a path-hygiene pass
    even when they look like refactors.
-4. The docs are then **validated mechanically** (internal links, unique doc numbering,
-   fixed layout, cited repo paths exist in the worktree, no stale renamed paths,
-   every doc linked from the hub).
-   Problems are fed back to the agent for repair rounds; in strict mode remaining
-   errors block publication and the commit is requeued.
-5. `run.sh` reads the agent's verdict (`vibedocing/verdicts/<sha>.json` + a one-line
-   `.txt`), advances the committed baseline (`agent/project/.vibedocing.json`),
-   auto-fills PROJECT.md's Sync Status, re-links any doc missing from the hub's
-   navigation (deterministic self-heal — the agent's per-commit rewrites can drop
-   old links), and **git-commits** the doc changes
-   (`docs(<project>): <subject>`).
+ 4. The docs are then **validated mechanically** (internal links, unique doc numbering,
+    fixed layout, cited repo paths exist in the worktree, no stale renamed paths,
+    every doc linked from the hub, both hub navigation sections present).
+    Problems are fed back to the agent for repair rounds; in strict mode remaining
+    errors block publication and the commit is requeued.
+ 5. `run.sh` reads the agent's verdict (`vibedocing/verdicts/<sha>.json` + a one-line
+    `.txt`), advances the committed baseline (`agent/project/.vibedocing.json`),
+    auto-fills PROJECT.md's Sync Status, re-links any doc missing from the hub's
+    navigation and re-creates a dropped navigation section (deterministic
+    self-heal — the agent's per-commit rewrites can drop old links or a whole
+    section), and **git-commits** the doc changes
+    (`docs(<project>): <subject>`).
 
 ## Restart after upstream changes
 
