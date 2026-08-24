@@ -39,7 +39,7 @@
     "api_key_env": "",
     "workers": 3,
     "queue": 2,
-    "temperature": null,
+    "temperature": 0.2,
     "max_tokens": 0,
     "request_timeout_seconds": 0,
     "retries": 0

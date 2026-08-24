@@ -42,28 +42,106 @@ Answer with ONE line of JSON and nothing else:
 
 verdict is "DOCUMENT" or "SKIP".
 
-DOCUMENT when the commit:
+DOCUMENT when the commit (judge from the DIFF, not the message):
 - adds a new user-facing function / command / route / screen / endpoint / capability;
+- adds a new configuration option, setting, flag, or preference key (a constant in \
+a preferences/config module is a user-facing knob);
+- adds new API surface in production code: a new class/type, or new non-private \
+methods, fields, or constants - even when the message sounds like a fix or cleanup \
+("handle some cases of X", "make Y apply only to Z", "adapt patches", "cleanup \
+after review");
+- materially changes the behavior of a core processing or output subsystem (new \
+handling for a construct/category, changed mapping or rendering rules, broader \
+input support), even when the diff is small and the message frames it as a fix;
+- changes the signature, visibility, or name of existing API: new overloads, changed \
+parameter/return types, constructors, or renamed methods/classes/constants/option \
+keys. Documentation cites these names: paired removal of old-name declarations and \
+addition of new-name ones (often across many files) is a rename - DOCUMENT it;
+- changes what the tool emits or produces for its users (output rendering, \
+formatting rules, naming, mappings, generated artifacts);
+- replaces a core mechanism or architecture (new pipeline stage, different \
+threading/context model, new intermediate representation), even when the message \
+calls it a refactor or rework;
+- fixes a total failure on an entire platform, version, or input class - a commit \
+message that pairs an issue ID or user report with a failure ("does not work \
+for/on X", "exception", "crash", "not supported") marks a capability gap, so a \
+small guard/fallback diff restoring operation is a DOCUMENT;
+- broadens support to a new input or toolchain category (a different compiler \
+such as ECJ vs javac, a new Java/JVM/Kotlin version, a new bytecode pattern or \
+obfuscation form) - typically a small addition inside an existing helper, not a \
+new file;
 - introduces a new module, package, service, or subsystem worth a design note;
-- materially changes the behavior or interface of an existing documented function;
-- adds a significant architectural pattern or cross-cutting mechanism;
 - renames, moves or deletes source files (path hygiene - documentation may cite \
 those paths). When in doubt for a rename/move/delete, answer DOCUMENT.
 
-SKIP when the commit is only: a bug fix, refactor, formatting, lint, build/CI, \
-dependency bump, tests, docs-only change, chore, typo, or a perf micro-tweak.
+SKIP when the commit is only: a narrow bug fix of one incorrect case, a refactor \
+with no API/behavior change, formatting, lint, build/CI, dependency bump, \
+tests/testdata only, docs-only change, chore, typo, or a perf micro-tweak. Changes \
+confined to test/spec directories or build files are never user-facing.
 
-Commit messages are unreliable - judge from the actual diff content provided. \
-When genuinely in doubt, SKIP: the map must stay high-signal and a real new \
-function is almost always obvious from the diff. Remember the asymmetry: a \
-DOCUMENT verdict is re-checked by a stronger agent (a false DOCUMENT only \
-costs one extra call), but a SKIP is final (a false SKIP is silently lost \
-documentation) - so never SKIP a change that might add or change a user-visible \
-capability."""
+Commit messages are unreliable - judge from the actual diff content provided. When \
+the full diff is omitted, you still get the NAME STATUS, DIFFSTAT and an API-SURFACE \
+DIGEST of declaration-like lines added (+) / removed (-): use them - a new "+" \
+declaration or paired "-"/"+" declarations mean new or renamed API. When a change \
+to non-test source code is genuinely on the border, answer DOCUMENT: a false \
+DOCUMENT only costs one extra check by a stronger agent, but a false SKIP is \
+silently lost documentation."""
 
 _JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 _VALID = ("DOCUMENT", "SKIP")
 _MAX_JSON_ATTEMPTS = 3
+
+# Declaration-ish added/removed lines extracted from oversized diffs so the
+# classifier still sees new/renamed API surface when the full diff does not fit.
+_DECL_LINE_RE = re.compile(
+    r"\b(?:public|protected|private|internal|export|extern|open|sealed|"
+    r"override|final|abstract)\b[^=\n]{0,120}\("
+    r"|\b(?:class|interface|enum|struct|record|trait|object|module)\s+[A-Za-z_]\w*"
+    r"|\b(?:def|fn|func|function|sub|proc|operator)\s+\w+"
+    r"|\bconst(?:ant)?\s+\w+\s*[:=]"
+    r"|\b[A-Z][A-Z0-9_]{2,}\s*=\s*[\"'\[0-9tfn]"
+    r"|#define\s+\w+"
+)
+_DECL_NOISE_RE = re.compile(r"^\s*(//|/\*|\*|import\b|from\b|package\b|using\b|"
+                            r"#include\b)")
+_TEST_PATH_RE = re.compile(r"(^|/)(tests?|spec|testdata|fixtures?)(/|$)|"
+                           r"(^|/)(test_[^/]*|[^/]*_test)\.[a-z]+$|"
+                           r"[Tt]est[A-Z_]|(^|/)build(/|$)", re.IGNORECASE)
+
+
+def declarations_digest(diff, cap):
+    """Declaration-like +/= lines from a diff that is too big to inject whole.
+
+    Keeps the signal a classifier needs for oversized commits: new types and
+    methods, option/constants, and paired removed/added declarations (renames).
+    Test/build paths are excluded - they are not user-facing surface.
+    """
+    out, seen, path, size = [], set(), None, 0
+    for line in diff.splitlines():
+        if line.startswith(("+++ ", "--- ")):
+            token = line[4:].strip()
+            if token != "/dev/null":
+                path = token.split("\t")[0][2:] if token[:2] in ("a/", "b/") \
+                    else token
+            continue
+        if not line[:1] in "+-" or line.startswith(("+++", "---")):
+            continue
+        if path and _TEST_PATH_RE.search(path):
+            continue
+        body = line[1:].strip()
+        if not body or len(body) > 200 or _DECL_NOISE_RE.match(body):
+            continue
+        if not _DECL_LINE_RE.search(body):
+            continue
+        key = line[:1] + body
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(key[:200])
+        size += len(key) + 1
+        if size >= cap:
+            break
+    return "\n".join(out)
 
 
 def log(msg):
@@ -106,8 +184,18 @@ def build_user_message(sha, repo, limits):
             parts.append("FULL DIFF (the COMPLETE change, nothing truncated - "
                          "classify from it directly):\n%s" % diff)
         else:
-            parts.append("(full diff omitted: %d chars - judge from name status "
-                         "+ diffstat)" % len(diff))
+            digest = declarations_digest(
+                diff, int(limits.get("diff_digest_chars") or 4000))
+            note = ("full diff omitted: %d chars - judge from name status + "
+                    "diffstat" % len(diff))
+            if digest:
+                note += (" + the API-surface digest below")
+                parts.append("(full diff omitted: %d chars)" % len(diff))
+                parts.append("API-SURFACE DIGEST (declaration-like lines added "
+                             "(+) / removed (-) by this commit, test and build "
+                             "files excluded):\n%s" % digest)
+            else:
+                parts.append("(%s)" % note)
     return "\n".join(parts)
 
 
@@ -125,34 +213,48 @@ def parse_verdict(text):
     return None, None
 
 
+def _add_usage(total, usage):
+    """Accumulate a provider usage block into {prompt,completion,total}."""
+    if not usage:
+        return total
+    total["prompt_tokens"] += int(usage.get("prompt_tokens") or 0)
+    total["completion_tokens"] += int(usage.get("completion_tokens") or 0)
+    total["total_tokens"] += int(usage.get("total_tokens") or 0)
+    return total
+
+
 def classify_one(client, sha, repo, limits):
-    """Classify a single commit. Returns (verdict, reason); never raises.
-    Root commits are DOCUMENT without an LLM call (the agent has a dedicated
+    """Classify a single commit. Returns (verdict, reason, usage); never
+    raises. usage sums provider-reported tokens across all LLM round-trips
+    for this commit (empty when no LLM call was needed). Root commits are
+    DOCUMENT without an LLM call (the agent has a dedicated
     initial-snapshot mode for them)."""
     if not P.sha_looks_valid(sha):
-        return "ERROR", "not a commit: %s" % sha
+        return "ERROR", "not a commit: %s" % sha, {}
     if not P.parent_sha(repo, sha):
-        return "DOCUMENT", "root commit (initial snapshot)"
+        return "DOCUMENT", "root commit (initial snapshot)", {}
     messages = [
         {"role": "system", "content": CLASSIFIER_SYSTEM},
         {"role": "user", "content": build_user_message(sha, repo, limits)},
     ]
+    usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     for _attempt in range(_MAX_JSON_ATTEMPTS):
         try:
             resp = client.chat(messages, None)
         except Exception as exc:  # FatalLLMError after client-level retries
-            return "ERROR", "llm: %s" % str(exc)[:300]
+            return "ERROR", "llm: %s" % str(exc)[:300], usage
+        _add_usage(usage, resp.get("usage"))
         text = (resp.get("content") or "").strip()
         verdict, reason = parse_verdict(text)
         if verdict:
-            return verdict, reason
+            return verdict, reason, usage
         messages = messages + [
             {"role": "assistant", "content": text[:2000]},
             {"role": "user", "content":
                 'Invalid answer. Reply with ONE line of JSON only: '
                 '{"verdict": "DOCUMENT" or "SKIP", "reason": "..."}'},
         ]
-    return "ERROR", "unparseable reply after %d attempts" % _MAX_JSON_ATTEMPTS
+    return "ERROR", "unparseable reply after %d attempts" % _MAX_JSON_ATTEMPTS, usage
 
 
 def read_progress(path, fallback):
@@ -224,7 +326,7 @@ def main(argv=None):
         % (model, cls["base_url"], len(shas), workers, queue_size))
 
     lock = threading.Lock()
-    state = {"done": {}, "inflight": 0, "next": 0}
+    state = {"done": {}, "inflight": 0, "next": 0, "usage": []}
     work = _queue.Queue()
 
     def worker():
@@ -234,20 +336,26 @@ def main(argv=None):
                 return
             idx, sha = item
             try:
-                verdict, reason = classify_one(client, sha, args.repo, limits)
+                verdict, reason, usage = classify_one(client, sha, args.repo,
+                                                      limits)
             except Exception as exc:  # one commit must never kill the worker
-                verdict, reason = "ERROR", "crash: %s" % exc
+                verdict, reason, usage = "ERROR", "crash: %s" % exc, {}
             try:
-                write_verdict(args.out, {
+                payload = {
                     "sha": sha, "verdict": verdict, "reason": reason,
                     "model": model, "index": idx,
                     "ts": datetime.now().isoformat(timespec="seconds"),
-                })
+                }
+                if usage.get("total_tokens"):
+                    payload["usage"] = usage
+                write_verdict(args.out, payload)
             except OSError as exc:
                 log("cannot write verdict for %s: %s" % (sha[:10], exc))
             with lock:
                 state["done"][idx] = verdict
                 state["inflight"] -= 1
+                if usage.get("total_tokens"):
+                    state["usage"].append(usage)
             log("[%d/%d] %s -> %s (%s)"
                 % (idx + 1, len(shas), sha[:10], verdict, reason[:120]))
 
@@ -290,8 +398,14 @@ def main(argv=None):
     counts = {"DOCUMENT": 0, "SKIP": 0, "ERROR": 0}
     for verdict in state["done"].values():
         counts[verdict] = counts.get(verdict, 0) + 1
-    log("classifier done: DOCUMENT=%d SKIP=%d ERROR=%d"
-        % (counts["DOCUMENT"], counts["SKIP"], counts["ERROR"]))
+    tokens = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    for usage in state["usage"]:
+        _add_usage(tokens, usage)
+    log("classifier done: DOCUMENT=%d SKIP=%d ERROR=%d tokens(prompt=%d "
+        "completion=%d total=%d)"
+        % (counts["DOCUMENT"], counts["SKIP"], counts["ERROR"],
+           tokens["prompt_tokens"], tokens["completion_tokens"],
+           tokens["total_tokens"]))
     return 0
 
 

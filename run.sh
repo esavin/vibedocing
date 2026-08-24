@@ -365,8 +365,11 @@ run_one() { # <sha>
     elif [ "$cverdict" = SKIP ] && classifier_may_skip "$sha"; then
       echo "[$short] SKIP (classifier)  $subject"
       printf 'VERDICT: NO_DOC(classifier)\n' > "$VERDICTS/$sha.txt"
-      jq -n --arg s "$sha" --arg r "$(jq -r '.reason // ""' "$CLS_VERDICTS/$sha.json" 2>/dev/null)" \
-         '{sha:$s, verdict:"NO_DOC", reason:("pre-classifier: " + $r)}' > "$VERDICTS/$sha.json" 2>/dev/null || true
+      local cu='null'
+      [ -s "$CLS_VERDICTS/$sha.json" ] && cu="$(jq -c '.usage // empty' "$CLS_VERDICTS/$sha.json" 2>/dev/null)"
+      [ -n "$cu" ] || cu='null'
+      jq -n --arg s "$sha" --arg r "$(jq -r '.reason // ""' "$CLS_VERDICTS/$sha.json" 2>/dev/null)" --argjson u "$cu" \
+         '{sha:$s, verdict:"NO_DOC", reason:("pre-classifier: " + $r)} + (if $u then {usage:$u} else {} end)' > "$VERDICTS/$sha.json" 2>/dev/null || true
       sync_set_baseline "$sha"
       save_progress --arg b "$sha" '.processed += [$b] | .skipped += 1'
       return 0
@@ -618,4 +621,15 @@ commit_baseline_if_dirty "${last_short:-none}"
 echo "=== summary ===" | tee -a "$WALK_LOG"
 echo "sync baseline: $(jq -r '.baseline' "$SYNC")"
 jq '{processed:(.processed|length), updated, skipped, failed, failures, last_run}' "$PROGRESS"
+# token accounting: full-agent verdicts vs classifier verdicts (when present)
+token_sum() { # <verdicts-glob> -> "prompt completion total"
+  jq -s '[.[] | .usage? // empty] | {p:(map(.prompt_tokens // 0)|add // 0), c:(map(.completion_tokens // 0)|add // 0), t:(map(.total_tokens // 0)|add // 0)} | "\(.p) \(.c) \(.t)"' "$@" 2>/dev/null || echo "0 0 0"
+}
+read -r AP AC AT <<< "$(token_sum "$VERDICTS"/*.json)"
+echo "tokens agent: prompt=$AP completion=$AC total=$AT"
+if [ -d "$CLS_VERDICTS" ]; then
+  read -r CP CC CT <<< "$(token_sum "$CLS_VERDICTS"/*.json)"
+  echo "tokens classifier: prompt=$CP completion=$CC total=$CT"
+  echo "tokens combined total: $((AT + CT))"
+fi
 gitw log --oneline -5 2>/dev/null | sed 's/^/  /'
