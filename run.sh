@@ -264,11 +264,20 @@ trap cleanup EXIT INT TERM
 # A subject matching commit_skip_regex is force-skipped ONLY when the commit
 # renames/moves/deletes nothing: an R/D commit may carry paths that existing
 # docs cite (path hygiene) and must still reach the agent.
+# grep -c reads the WHOLE diff (no -q early exit): under `set -o pipefail`
+# grep -q can exit on the first hit while git is still writing, git dies with
+# SIGPIPE (141), the pipeline status flips, and `!` would wrongly ALLOW the
+# skip for a rename/delete commit - a race that leaks stale cited paths.
+has_rd_changes() { # <sha> -> rc 0 when the commit renames/moves/deletes anything
+  local n
+  n="$(g diff --name-status -M "$1^" "$1" | grep -cE '^[RD]')" || n=0
+  [ "$n" -gt 0 ]
+}
 regex_skips() { # <sha> <subject>
   [ -n "$SKIP_REGEX" ] || return 1
   [[ "$2" =~ $SKIP_REGEX ]] || return 1
   g rev-parse --verify --quiet "$1^" >/dev/null 2>&1 || return 0  # root commit: no R/D
-  ! g diff --name-status -M "$1^" "$1" | grep -qE '^[RD]'
+  ! has_rd_changes "$1"
 }
 
 # ---- parallel pre-classifier (--classifier) ----
@@ -321,7 +330,7 @@ await_classifier() { # <sha> -> prints DOCUMENT|SKIP|ERROR; rc=1 if the classifi
 # existing docs cite (path hygiene) - those go to the agent, like regex skips.
 classifier_may_skip() { # <sha>
   g rev-parse --verify --quiet "$1^" >/dev/null 2>&1 || return 1
-  ! g diff --name-status -M "$1^" "$1" | grep -qE '^[RD]'
+  ! has_rd_changes "$1"
 }
 
 # ---- run one commit ----
