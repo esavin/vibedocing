@@ -23,6 +23,12 @@
 # section `classifier`) that pre-decides DOCUMENT vs SKIP a few commits ahead; SKIP
 # commits then never reach the full agent. The two modes are mutually exclusive.
 #
+# SNAPSHOT BOOTSTRAP (--snapshot [REF]): for histories of thousands+ commits, skip
+# the replay entirely - one planner request partitions the tree at REF (default HEAD)
+# into modules, one agent session per module writes that module's initial docs, the
+# baseline jumps to REF, and subsequent regular runs document only NEW commits.
+# Interrupted snapshots resume: finished modules are skipped on re-run.
+#
 # Auto-commit: when the agent changes docs, this script commits them to the workspace git
 # repo (the project folder and this tooling folder are gitignored). One commit per
 # documented project commit, plus a trailing baseline commit if needed.
@@ -442,6 +448,12 @@ read -r -d '' USAGE <<'EOF' || true
 Usage: run.sh [options]
 
   (no args)       Run the walk from the committed baseline up to project HEAD.
+  --snapshot [R]  Bootstrap the docs map from the CURRENT tree at commit R
+                  (default HEAD) instead of replaying history: a planner
+                  request partitions the tree into modules, then one agent
+                  session per module writes its initial docs. Sets the
+                  baseline to R - later runs replay only newer commits.
+                  Interrupted snapshots resume (finished modules skipped).
   --list          Show commit list + SKIP/PROCESS decisions, then exit (no agent calls).
   --dry-run       Invoke the agent in classify-only mode (no doc writes, no commits).
   --validate [S]  Validate existing docs against the tree at commit S (default HEAD):
@@ -484,6 +496,7 @@ EOF
 DO_LIST=0; RESET_BASE=0; LIMIT=0; RANGE=""; SINGLE=""; OVERRIDE_MODEL=""
 STOP_ON_FAIL=0; CLASSIFY_ONLY=0; VALIDATE=0; VALIDATE_REF=""
 REUSE_VERDICTS=""; SKIP_LIST=""; DOC_HINTS=0; USE_CLASSIFIER=0
+SNAPSHOT=0; SNAPSHOT_REF=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --list) DO_LIST=1;;
@@ -491,6 +504,8 @@ while [ $# -gt 0 ]; do
     --validate) VALIDATE=1
                  if [ $# -ge 2 ] && [[ "$2" != -* ]]; then VALIDATE_REF="$2"; shift; fi;;
     --reset-baseline) RESET_BASE=1;;
+    --snapshot) SNAPSHOT=1
+                 if [ $# -ge 2 ] && [[ "$2" != -* ]]; then SNAPSHOT_REF="$2"; shift; fi;;
     --limit) LIMIT="${2:?--limit needs N}"; shift;;
     --range) RANGE="${2:?--range needs A..B}"; shift;;
     --sha) SINGLE="${2:?--sha needs SHA}"; shift;;
@@ -514,6 +529,53 @@ init_sync; init_progress
 [ "$RESET_BASE" = 1 ] && { sync_set_baseline ""; rm -f "$PROGRESS"; init_progress; echo "Baseline reset to start."; exit 0; }
 
 [ -d "$SOURCE_DIR/.git" ] || die "source_root '$SOURCE_DIR' is not a git repository (set source_root in config.json)"
+
+# ---- snapshot bootstrap mode: document the CURRENT tree, skip history ----
+if [ "$SNAPSHOT" = 1 ]; then
+  if [ "$DO_LIST" != 0 ] || [ "$RESET_BASE" != 0 ] || [ "$VALIDATE" != 0 ] \
+     || [ "$CLASSIFY_ONLY" != 0 ] || [ -n "$SINGLE" ] || [ -n "$RANGE" ] \
+     || [ "$LIMIT" != 0 ] || [ -n "$REUSE_VERDICTS" ] || [ -n "$SKIP_LIST" ] \
+     || [ "$DOC_HINTS" != 0 ] || [ "$USE_CLASSIFIER" != 0 ]; then
+    die "--snapshot cannot be combined with --list/--dry-run/--validate/--reset-baseline/--sha/--range/--limit/--reuse-verdicts/--skip-list/--doc-hints/--classifier"
+  fi
+  [ -n "${OVERRIDE_MODEL:-}" ] || [ -n "$CFG_MODEL" ] || \
+    die "no model configured: set llm.model in config.json or export VIBE_MODEL"
+  REF="${SNAPSHOT_REF:-HEAD}"
+  FULL="$(g rev-parse --verify --quiet "$REF^{commit}" || true)"
+  [ -n "$FULL" ] || die "commit not found for --snapshot: $REF"
+  load_meta "$FULL"
+  path="$(make_tree "$FULL")"
+  CUR_TREE="$path"
+  echo "=== snapshot bootstrap at ${SHORT[$FULL]} $(date -Iseconds) ===" | tee -a "$WALK_LOG"
+  snap_args=(python3 -m vibe_agent.snapshot --config "$CONFIG" --ref "$FULL" --worktree "$path"
+             --docs-root "$DOCS_ROOT" --docs-root-rel "$DOCS_ROOT_REL"
+             --verdicts-dir "$VERDICTS")
+  [ -n "${OVERRIDE_MODEL:-}" ] && snap_args+=(--model "$OVERRIDE_MODEL")
+  SNAP_LOG="$RUN_LOGS/snapshot-${SHORT[$FULL]}.log"
+  rc=0
+  # stream progress live to the terminal AND the log file: a snapshot runs
+  # planner + one agent session per module (often hours), and redirecting
+  # everything to the log makes the run look hung; PIPESTATUS[0] keeps the
+  # agent's own exit code (not tee's) under pipefail
+  if [ -n "$RUN_TIMEOUT" ] && [ "$RUN_TIMEOUT" != 0 ] && command -v timeout >/dev/null 2>&1; then
+    timeout "${RUN_TIMEOUT}s" "${snap_args[@]}" 2>&1 | tee "$SNAP_LOG" || rc=${PIPESTATUS[0]}
+  else
+    "${snap_args[@]}" 2>&1 | tee "$SNAP_LOG" || rc=${PIPESTATUS[0]}
+  fi
+  free_tree "$path"
+  CUR_TREE=""
+  verdict="$(head -1 "$VERDICTS/$FULL~snapshot.txt" 2>/dev/null || true)"
+  case "$verdict" in
+    VERDICT:\ DOC_UPDATED*|VERDICT:\ NO_DOC)
+      sync_set_baseline "$FULL"
+      jq --arg s "$FULL" '.snapshot = $s' "$SYNC" > "$SYNC.tmp" 2>/dev/null \
+        && mv "$SYNC.tmp" "$SYNC" || rm -f "$SYNC.tmp"
+      commit_docs "${SHORT[$FULL]}" "snapshot bootstrap (tree documented at ${SHORT[$FULL]})"
+      echo "[${SHORT[$FULL]}] SNAPSHOT -> done ($verdict)" | tee -a "$WALK_LOG"
+      exit 0;;
+    *) die "snapshot failed (rc=$rc): $verdict — see logs/snapshot-${SHORT[$FULL]}.log";;
+  esac
+fi
 
 # ---- standalone validation mode: audit the docs map without any agent calls ----
 if [ "$VALIDATE" = 1 ]; then

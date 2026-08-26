@@ -15,13 +15,15 @@ _To be populated._
 
 ## Function Documentation
 
-<!-- Links to `functions/<number>-<name>.md` are added here as functions are documented. -->
+<!-- Module indexes (functions/<module>.md) and flat docs (functions/<number>-<name>.md)
+     are linked here as functions are documented. -->
 
 _(none yet)_
 
 ## Technical Design Documents
 
-<!-- Links to `design/<number>-<name>.md` are added here as designs are documented. -->
+<!-- Module indexes (design/<module>.md) and flat docs (design/<number>-<name>.md) are
+     linked here as designs are documented. -->
 
 _(none yet)_
 

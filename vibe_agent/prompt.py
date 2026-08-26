@@ -140,12 +140,13 @@ repairs). Never fabricate.
 6. write_doc paths are DOCS-ROOT-relative and the layout is FIXED: write only \
 functions/<number>-<name>.md, design/<number>-<name>.md, PROJECT.md, \
 project-conventions.md, or update-documents.md (<number> = two digits: 01, 02, ...). \
-Do NOT prefix paths with agent/ or \
-agent/project/ (the tool resolves paths against DOCS ROOT itself) and do NOT mirror \
-source-tree folders inside the docs root. Keep each write_doc SHORT (~150 lines \
-max): if a call is ever refused with "arguments JSON is incomplete", your output \
-was cut by the token limit - write the first half, then continue the SAME file \
-with write_doc {"path": ..., "append": true, "content": ...} parts.
+Do NOT prefix paths with agent/ or agent/project/ (the tool resolves paths against \
+DOCS ROOT itself) and do NOT mirror source-tree folders inside the docs root \
+(a module DIRECTORY under functions/ or design/ is part of the layout, not a \
+mirrored source folder). Keep each write_doc SHORT (~150 lines max): if a call is \
+ever refused with "arguments JSON is incomplete", your output was cut by the token \
+limit - write the first half, then continue the SAME file with write_doc \
+{"path": ..., "append": true, "content": ...} parts.
 
 ## Function doc template (functions/<number>-<name>.md)
 # <Function Name> Function
@@ -201,6 +202,42 @@ config. You are one step of the loop, not the loop.
 verdict "ERROR" and a reason.
 - finish(verdict, files, reason) is the ONLY way to end. verdict: "DOC_UPDATED", \
 "NO_DOC", or "ERROR"; files = docs-root-relative paths you created/modified."""
+
+# Appended to SYSTEM_PROMPT when the workspace uses the module layout
+# (config "modules": true). With thousands of docs a flat directory and a
+# single hub listing every doc stop scaling; docs are grouped per module
+# instead: the hub links module indexes, each index links its module's docs.
+MODULES_ADDENDUM = """
+
+# Module layout (this workspace groups docs by module)
+- functions/<module>.md is the INDEX of a module; the module's docs live in \
+functions/<module>/<number>-<name>.md (same for design/). Each module \
+directory has its OWN numbering starting at 01, and <module> is a lowercase \
+slug (letters, digits, dashes).
+- File every NEW doc under the module it belongs to; create the module index \
+when the module is new (one-paragraph intro + a "## Documents" section \
+linking the module's docs). Update the index whenever you add or remove a \
+module doc.
+- PROJECT.md's two navigation sections list MODULE INDEXES (and any legacy \
+flat docs), never individual module docs: hub -> index -> docs.
+- GRANULARITY: one doc per CAPABILITY CLUSTER, not per function symbol. \
+Related functions (e.g. a family of operations on the same data type) share \
+ONE doc listing them; only genuinely standalone marquee features get their \
+own doc. A module with dozens of tiny per-symbol docs is WRONG.
+- Relative links from a module doc: sibling doc "./<number>-<name>.md", \
+module index "../<module>.md", design counterpart \
+"../../design/<module>/<number>-<name>.md". From the index to a module doc: \
+"<module>/<number>-<name>.md".
+- Legacy flat docs (functions/<number>-<name>.md created before the module \
+layout) stay valid and keep their hub links; do not renumber or move them \
+unless the commit itself renames things."""
+
+
+def system_prompt(modules=False):
+    """SYSTEM_PROMPT plus the module-layout addendum when enabled."""
+    if modules:
+        return SYSTEM_PROMPT + MODULES_ADDENDUM
+    return SYSTEM_PROMPT
 
 
 class InspectError(Exception):
@@ -419,13 +456,13 @@ def _compact_ranges(numbers):
 def docs_numbering(docs_root):
     """Per-directory numbering state with the exact next free number, so the
     model never guesses (fernflower runs continued design/'s counter into
-    functions/ - 01-09 then 22-25 - leaving 10-21 free forever)."""
-    from vibe_agent.validate import _NUMBER_RE, DOCS_TOP_DIRS
+    functions/ - 01-09 then 22-25 - leaving 10-21 free forever). With module
+    layout each module directory carries its own counter and is listed as its
+    own directory."""
+    from vibe_agent.validate import _NUMBER_RE, DOCS_TOP_DIRS, MODULE_SLUG_RE
     lines = []
-    for directory in sorted(DOCS_TOP_DIRS):
-        path = os.path.join(docs_root, directory)
-        if not os.path.isdir(path):
-            continue
+
+    def emit(directory, path):
         used = []
         for name in sorted(os.listdir(path)):
             if name.startswith(".") or not name.lower().endswith(".md"):
@@ -434,7 +471,7 @@ def docs_numbering(docs_root):
             if match:
                 used.append(int(match.group(1)))
         if not used:
-            continue
+            return
         used.sort()
         lowest = 1
         while lowest in used:
@@ -444,24 +481,37 @@ def docs_numbering(docs_root):
             "- %s/: numbers in use %s - the LOWEST FREE number for a NEW doc "
             "here is %02d. Number docs per-directory: NEVER continue another "
             "directory's numbering." % (directory, ranges, lowest))
+
+    for directory in sorted(DOCS_TOP_DIRS):
+        path = os.path.join(docs_root, directory)
+        if not os.path.isdir(path):
+            continue
+        emit(directory, path)
+        for name in sorted(os.listdir(path)):
+            mpath = os.path.join(path, name)
+            if MODULE_SLUG_RE.match(name) and os.path.isdir(mpath):
+                emit("%s/%s" % (directory, name), mpath)
     return "\n".join(lines)
 
 
 def docs_overview(docs_root, max_chars=6000, max_entries=80):
-    """One line per existing doc (path + title from its first heading), plus a
-    visible "(no docs yet)" marker for each EMPTY top-level directory.
+    """One line per navigable docs entry, plus a visible "(no docs yet)"
+    marker for each EMPTY top-level directory.
 
-    Mechanically rebuilt from disk for every commit - like docs_numbering -
-    so it can never go stale. Injecting it into the first user message lets
-    the agent decide NEW vs UPDATE without spending read_file steps
-    re-discovering the map (Problem 2 of the perf report: per-commit
-    re-reading of PROJECT.md and the doc list). The empty-dir markers keep
-    the functions/design LEVELS visible even when one of them has no docs
-    yet - otherwise the agent sees a design-only map and files every new
-    capability doc under design/ (a real run lost the whole functions level
-    that way).
+    With the module layout this is MODULE-LEVEL, not doc-level: module
+    indexes and flat docs are listed, module docs are not (they are listed
+    inside their index - the agent reads the one relevant index instead of
+    the pipeline injecting thousands of lines). Mechanically rebuilt from
+    disk for every commit - like docs_numbering - so it can never go stale.
+    Injecting it into the first user message lets the agent decide NEW vs
+    UPDATE without spending read_file steps re-discovering the map. The
+    empty-dir markers keep the functions/design LEVELS visible even when one
+    of them has no docs yet - otherwise the agent sees a design-only map and
+    files every new capability doc under design/ (a real run lost the whole
+    functions level that way).
     """
-    from vibe_agent.validate import DOCS_TOP_DIRS
+    from vibe_agent.validate import (_NUMBER_RE, DOCS_TOP_DIRS,
+                                     MODULE_SLUG_RE)
 
     def first_title(path):
         try:
@@ -480,11 +530,29 @@ def docs_overview(docs_root, max_chars=6000, max_entries=80):
     for directory in sorted(DOCS_TOP_DIRS):
         dpath = os.path.join(docs_root, directory)
         names = []
+        modules = []
         if os.path.isdir(dpath):
-            names = [name for name in sorted(os.listdir(dpath))
-                     if not name.startswith(".")
-                     and name.lower().endswith(".md")]
-        if names:
+            for name in sorted(os.listdir(dpath)):
+                if name.startswith(".") or not name.lower().endswith(".md"):
+                    continue
+                stem = name[:-3].lower()
+                if (_NUMBER_RE.match(name) is None and stem
+                        and MODULE_SLUG_RE.match(stem)):
+                    modules.append(stem)
+                else:
+                    names.append(name)
+        if names or modules:
+            for module in modules:
+                mdir = os.path.join(dpath, module)
+                docs = [fn for fn in sorted(os.listdir(mdir))
+                        if fn.lower().endswith(".md")] \
+                    if os.path.isdir(mdir) else []
+                rows.append("- %s/%s.md - %s [MODULE INDEX - %d doc(s) live "
+                            "under %s/%s/; read_file this index before adding "
+                            "a doc to the module]"
+                            % (directory, module,
+                               first_title(os.path.join(dpath, module + ".md"))
+                               or "(untitled)", len(docs), directory, module))
             for name in names:
                 rel = "%s/%s" % (directory, name)
                 rows.append("- %s - %s"
@@ -498,8 +566,8 @@ def docs_overview(docs_root, max_chars=6000, max_entries=80):
         return ""
     more = ""
     if len(rows) > max_entries:
-        more = "\n(+%d more - enumerate with list_dir functions/ design/)" \
-               % (len(rows) - max_entries)
+        more = ("\n(+%d more - enumerate with list_dir functions/ design/)"
+                % (len(rows) - max_entries))
         rows = rows[:max_entries]
     text = "\n".join(rows) + more
     if len(text) > max_chars:
@@ -617,11 +685,14 @@ def build_first_user(sha, worktree, docs_root, mode, today, conventions,
                                  int(lim.get("docs_overview_chars") or 6000))
         if overview:
             sections.append(
-                "DOCS MAP OVERVIEW (every existing doc with its title - functions/ "
-                "docs describe user-facing capabilities, design/ docs the technical "
-                "how; decide NEW vs UPDATE from this list; read a specific doc ONLY "
-                "if you will edit it, and never create a second doc for a topic "
-                "already listed here):\n%s" % overview
+                "DOCS MAP OVERVIEW (module indexes and flat docs with their "
+                "titles - functions/ docs describe user-facing capabilities, "
+                "design/ docs the technical how; decide NEW vs UPDATE from "
+                "this list; module docs are listed inside their index - "
+                "read_file the index of the module you are about to touch; "
+                "read a specific doc ONLY if you will edit it, and never "
+                "create a second doc for a topic already covered):\n%s"
+                % overview
             )
 
     if not conventions:
@@ -765,3 +836,231 @@ def build_reconsider_message(hint, classify_only=False):
         "This reconsideration is offered exactly once: call finish now with "
         "your FINAL verdict." % (action, reason, extra)
     ) + "\n" + "\n\n".join(parts)
+
+
+# ---- snapshot bootstrap (run.sh --snapshot; vibe_agent/snapshot.py) ----
+# One planner request partitions the tree into modules; then ONE agent
+# session per module documents that module's share of the CURRENT tree. The
+# baseline then jumps to the snapshot commit and only NEW commits are
+# replayed - the only sane cost curve for histories of tens of thousands of
+# commits.
+
+SNAPSHOT_SYSTEM_PROMPT = """You are one session of an automated documentation \
+pipeline that bootstraps a documentation map from the CURRENT tree of a \
+project (a "snapshot" - no commit history is replayed; every file in the \
+worktree is at the snapshot state). Your session owns exactly ONE module. \
+You write the initial documentation for that module: a module index, a \
+handful of capability-cluster function docs, and at most one or two design \
+docs.
+
+# Ground truth rules (hard)
+- The ONLY source of truth is the repository content in the WORKTREE. Prior \
+knowledge about this project - other releases, older versions, forks, \
+upstream articles, public docs - is NOT a source. Package names, \
+class/method/field names, option keys, entry points and file paths must all \
+be read from the worktree before you write them.
+- Copy identifiers, signatures and option keys VERBATIM from source files \
+you read in this session (copy-paste, never retype from memory). If you have \
+not verified an identifier in the worktree, do not mention it.
+- Cite source files as paths relative to the REPOSITORY ROOT (the worktree \
+root), exactly as they exist there.
+
+# What to write (in this order)
+1. The MODULE INDEX file (path given in the task): a "# <Module> " heading, \
+a one-paragraph overview of what the module does, then "## Documents" with \
+one link line per doc you create (this session and earlier sessions alike - \
+the pipeline also appends missing links deterministically).
+2. Function docs for the module's user-facing CAPABILITY CLUSTERS. \
+GRANULARITY (hard): one doc per cluster of related functions, NOT one doc \
+per function symbol. Typical module: 3-8 function docs. A module with one \
+doc per tiny function is WRONG; a doc listing a family of related operations \
+with their signatures is RIGHT.
+3. AT MOST one or two design docs for the module's architecture (skip when \
+the module has no interesting architecture).
+Budget your steps: verify by reading the module's key files, write the docs, \
+call finish before the step limit. Partial coverage is fine - invented \
+coverage is not; when unsure, document less.
+
+# Doc update rules
+1. Docs you create follow the templates below. Number them per-module \
+starting at 01 (the DOCS NUMBERING section lists the exact state - use it).
+2. Touch ONLY this module's files (its index and docs under its module \
+directory). Other modules belong to sibling sessions running with the same \
+layout.
+3. In every file you write: set *Last updated: <TODAY>* and *Areas: ...* per \
+the conventions file.
+4. write_doc paths are DOCS-ROOT-relative; keep each call SHORT (~150 lines \
+max) and split longer docs with {"append": true} parts.
+5. Always end by calling the finish tool exactly once with verdict \
+"DOC_UPDATED" and files = the docs-root-relative paths you created/modified \
+(or "NO_DOC" when the module genuinely has nothing user-facing to document).
+
+## Function doc template (functions/<module>/<number>-<name>.md)
+# <Capability Cluster> Function
+## Description
+<what the cluster does, from the user's perspective>
+## Key Features
+- <feature>
+## Related Documentation
+### Technical Details
+- [Design doc](../../design/<module>/<number>-<name>.md) - design overview
+### Source Files
+- src/.../path/to/file.ext - main implementation
+### Related Functions
+- [Cluster](./<number>-<name>.md) - connection
+## Implementation Notes
+<brief developer-relevant detail>
+
+---
+*Last updated: YYYY-MM-DD*
+*Areas: <area>*
+
+## Design doc template (design/<module>/<number>-<topic>.md)
+# <Topic> Design
+## Overview
+<brief>
+## Architecture / Components
+### <Component>
+**File:** src/.../path/to/file.ext
+**Purpose:** <what it does>
+**API / Interface:** <short code snippet copied verbatim from the source>
+## Design Decisions
+<key decisions and rationale>
+## Source Files
+- src/.../path/to/file.ext - description
+
+---
+*Last updated: YYYY-MM-DD*
+*Areas: <area>*
+
+# What counts as a "function" (language-agnostic heuristics)
+CLI commands/subcommands; HTTP/RPC/GraphQL endpoints and route handlers; public API \
+surface of a library/SDK; UI screens/pages/major components; event handlers, background \
+jobs, schedulers, queues, webhook receivers; extension points (plugins, hooks, \
+middleware); config-gated features; persistence services and their key operations; \
+auth/permission/identity flows. A "function" is something a user or integrator would \
+name and look up; internal helpers belong in a design doc, if anywhere.
+
+# Hard rules
+- Write ONLY .md files under DOCS ROOT, only for YOUR module; never modify \
+the worktree or any other file.
+- The git tool is read-only (show/log/diff/ls-tree/grep).
+- finish(verdict, files, reason) is the ONLY way to end. verdict: "DOC_UPDATED", \
+"NO_DOC", or "ERROR"; files = docs-root-relative paths you created/modified."""
+
+
+def tree_digest_paths(worktree, ref, paths, max_dirs=30, max_files=20000):
+    """Directory digest of the tree at <ref> restricted to <paths> (a module's
+    source roots). Same shape as _tree_digest so both read naturally."""
+    argv = ["ls-tree", "-r", "--name-only", ref, "--"] + list(paths)
+    raw = _git(worktree, argv)
+    names = raw.splitlines()[:max_files]
+    total = max(len(raw.splitlines()), len(names))
+    per_dir = {}
+    for name in names:
+        dirn = os.path.dirname(name)
+        if dirn:
+            per_dir[dirn] = per_dir.get(dirn, 0) + 1
+    lines = ["total files under this module's roots: %d%s"
+             % (total, "  (digest capped at %d)" % max_files
+                if total >= max_files else "")]
+    lines.append("directories (real layout - read the key files from THIS):")
+    for name, count in sorted(per_dir.items(), key=lambda kv: (-kv[1], kv[0]))[:max_dirs]:
+        lines.append("  %s  (%d files)" % (name, count))
+    if not names:
+        lines.append("  (no files found under the module roots - check with "
+                     "git ls-tree)")
+    return "\n".join(lines)
+
+
+def build_snapshot_user(module, ref, worktree, docs_root, today, conventions,
+                        limits=None, modules_layout=True):
+    """First user message of one per-module snapshot session.
+
+    `module` = {"module": slug, "title": str, "paths": [...], "summary": str}
+    from the planner (or the mechanical fallback partition)."""
+    lim = limits if isinstance(limits, dict) else {}
+    sections = []
+    slug = module["module"]
+    sections.append(
+        "MODULE: %s - %s\n%s" % (slug, module.get("title") or slug,
+                                 module.get("summary") or ""))
+    sections.append("MODULE SOURCE ROOTS (the files below these roots are "
+                    "yours; other modules belong to sibling sessions):\n%s"
+                    % "\n".join("- %s" % p for p in module.get("paths") or []))
+    sections.append("TREE DIGEST at the snapshot commit, restricted to your "
+                    "module's roots:\n%s"
+                    % _cap(tree_digest_paths(worktree, ref,
+                                             module.get("paths") or []),
+                           int(lim.get("tree_digest_chars") or 8000)))
+    if modules_layout:
+        sections.append(
+            "YOUR FILES: module index functions/%s.md; function docs "
+            "functions/%s/<number>-<name>.md; design docs design/%s/"
+            "<number>-<name>.md (create the design/ module directory only "
+            "when you write a design doc)." % (slug, slug, slug))
+    else:
+        sections.append(
+            "YOUR FILES: function docs functions/<number>-<name>.md and "
+            "design docs design/<number>-<name>.md (shared flat "
+            "directories; the DOCS NUMBERING section lists the current "
+            "counters)")
+    numbering = docs_numbering(docs_root)
+    if numbering:
+        sections.append("DOCS NUMBERING (exact current state - use these "
+                        "numbers, do not compute your own):\n%s" % numbering)
+    overview = docs_overview(docs_root,
+                             int(lim.get("docs_overview_chars") or 6000))
+    if overview:
+        sections.append(
+            "DOCS MAP OVERVIEW (module indexes and flat docs; to see another "
+            "module's docs read its index - do NOT re-list it):\n%s" % overview)
+    if not conventions:
+        conventions = ("(missing - infer conservatively from the source tree and flag "
+                       "uncertainties in the doc footer)")
+    parts = [
+        "SNAPSHOT BOOTSTRAP: document the CURRENT TREE of module \"%s\"." % slug,
+        "",
+        "This is not a commit review: every file in the worktree is at the "
+        "snapshot state. Write this module's INITIAL documentation now.",
+        "",
+    ]
+    parts.extend(section + "\n" for section in sections)
+    parts.extend([
+        "WORKTREE: %s" % worktree,
+        "DOCS ROOT: %s" % docs_root,
+        "MODE: document",
+        "TODAY: %s" % today,
+        "",
+        "PROJECT CONVENTIONS (from project-conventions.md):",
+        _cap(conventions.strip(), int(lim.get("conventions_chars") or 12000)),
+        "",
+        "Begin: inspect your module's key files, write the index and the "
+        "cluster docs, then call finish.",
+    ])
+    return "\n".join(parts)
+
+
+PLANNER_SYSTEM = """You are the module planner of an automated documentation \
+pipeline. Given a digest of a repository tree, partition it into MODULES: \
+coherent user-facing areas a documentation reader would look up. Reply with \
+ONLY a JSON array (no markdown fences, no prose), each element:
+{"module": "<lowercase-slug>", "title": "<Short Title>", "paths": ["<repo path prefix>", ...], "summary": "<one sentence>"}
+Rules:
+- 3 to 25 modules; each module's paths are repository-root-relative directory \
+prefixes that exist in the digest.
+- Cover the SOURCE code; you may skip obvious non-documentable trees (build \
+scripts, vendored dependencies, test fixtures) by simply not listing them.
+- Slugs: lowercase ASCII letters, digits and dashes only.
+- Prefer grouping a large uniform tree (e.g. many sibling subsystem \
+directories) into a few modules over one module per leaf directory."""
+
+
+def build_planner_user(tree_digest_text, conventions):
+    return (
+        "Partition this repository into documentation modules.\n\n"
+        "TREE DIGEST:\n%s\n\n"
+        "PROJECT CONVENTIONS:\n%s\n\n"
+        "Reply with ONLY the JSON array."
+        % (tree_digest_text, (conventions or "(none)")[:4000])
+    )

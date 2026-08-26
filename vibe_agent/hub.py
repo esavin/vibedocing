@@ -1,7 +1,13 @@
-"""Deterministic maintenance of PROJECT.md (Sync Status + navigation coverage).
+"""Deterministic maintenance of PROJECT.md + module indexes (Sync Status,
+navigation coverage).
 
-Two LLM-drift failure modes in the hub are maintained by the pipeline, not by
-the model:
+Two docs layouts coexist (a workspace may migrate between them):
+
+  flat     functions/<number>-<name>.md                linked from PROJECT.md
+  modular  functions/<module>/<number>-<name>.md       linked from the index
+           functions/<module>.md  (module INDEX)       linked from PROJECT.md
+
+LLM-drift failure modes maintained by the pipeline, not by the model:
 
 - the external audit found "Baseline commit: (none), Last synced: (never)" in
   a fully documented project: the sync fields were left to the LLM, which never
@@ -12,7 +18,11 @@ the model:
   longer reachable from PROJECT.md (a real run: 45 of 197 docs linked). After
   every processed commit the pipeline now re-adds a link entry for every
   functions/ or design/ doc the hub no longer lists and drops entries pointing
-  to docs that no longer exist.
+  to docs that no longer exist. With module layout the heal is two-tier: every
+  module dir gets its index file (skeleton re-created when missing), every
+  module doc gets an entry in its index, and every index gets an entry in the
+  hub - so the map stays navigable at ANY size without the hub listing every
+  doc.
 - dropped navigation sections: an agent rewrite of the hub can delete a whole
   section heading (a real run lost "## Function Documentation" in the root
   commit and every later capability doc then landed in design/). The
@@ -36,7 +46,7 @@ import re
 import sys
 
 from .validate import (_HEADING_RE, _LINK_RE, _SKIP_PREFIXES, DOCS_TOP_DIRS,
-                       NAV_SECTION_KEYS)
+                       NAV_SECTION_KEYS, docs_inventory)
 
 HUB = "PROJECT.md"
 _BASELINE_RE = re.compile(r"^(\s*-\s*\*\*[Bb]aseline commit:\*\*.*)$")
@@ -50,10 +60,12 @@ _SECTION_HEADING = {
     "design": "## Technical Design Documents",
 }
 _SECTION_COMMENT = {
-    "functions": "<!-- Links to `functions/<number>-<name>.md` are added here "
-                 "as functions are documented. -->",
-    "design": "<!-- Links to `design/<number>-<name>.md` are added here as "
-              "designs are documented. -->",
+    "functions": "<!-- Module indexes (functions/<module>.md) and flat docs "
+                 "(functions/<number>-<name>.md) are linked here as they are "
+                 "documented. -->",
+    "design": "<!-- Module indexes (design/<module>.md) and flat docs "
+              "(design/<number>-<name>.md) are linked here as designs are "
+              "documented. -->",
 }
 _SECTION_PLACEHOLDER = "_(none yet)_"
 _HR_RE = re.compile(r"^-{3,}\s*$")
@@ -112,8 +124,12 @@ def _doc_title(path, fallback):
     return fallback
 
 
-def _link_targets(line, docs_root):
-    """Docs-root-relative paths of every markdown link target on this line."""
+def _link_targets(line, base):
+    """Base-relative paths of every markdown link target on this line.
+
+    `base` is the absolute directory the containing file lives in (the docs
+    root for PROJECT.md, functions/ or design/ for a module index), so
+    relative links resolve the way markdown renders them."""
     targets = []
     for match in _LINK_RE.finditer(line):
         target = match.group(2).strip()
@@ -122,35 +138,88 @@ def _link_targets(line, docs_root):
         target = target.split("#", 1)[0].split()[0]
         if not target:
             continue
-        rel = os.path.relpath(os.path.normpath(os.path.join(docs_root, target)),
-                              docs_root)
+        rel = os.path.relpath(os.path.normpath(os.path.join(base, target)),
+                              base)
         targets.append(rel.replace(os.sep, "/"))
     return targets
 
 
+def _write_lines(path, lines):
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+
+def _reconcile_module_indexes(docs_root, inv):
+    """Tier 2 of the heal: every module dir has an index file, and every
+    module doc is linked from it. Creates skeleton indexes, appends entries
+    for docs missing from an index, drops entries whose target vanished.
+    Returns (created_indexes, entries_added, entries_dropped)."""
+    created = added = dropped = 0
+    for directory, entry in inv.items():
+        base = os.path.join(docs_root, directory)
+        for module, names in entry["modules"].items():
+            ipath = os.path.join(base, module + ".md")
+            existed = os.path.isfile(ipath)
+            lines = _read_lines(ipath)
+            if lines is None:
+                lines = ["# %s" % module, "",
+                         "## Documents", "", _SECTION_PLACEHOLDER]
+                created += 1
+            linked = {t for line in lines for t in _link_targets(line, base)}
+            missing = ["%s/%s" % (module, name) for name in names
+                       if "%s/%s" % (module, name) not in linked]
+            out = []
+            for line in lines:
+                if missing and _PLACEHOLDER_RE.match(line):
+                    continue  # first real entries replace the placeholder
+                own = _link_targets(line, base)
+                if own and all(not os.path.isfile(os.path.join(base, t))
+                               for t in own):
+                    dropped += 1
+                    continue
+                out.append(line)
+            if missing:
+                while out and not out[-1].strip():
+                    out.pop()
+                if not any(_HEADING_RE.match(line)
+                           and "document" in line.lower() for line in out):
+                    out.extend(["", "## Documents"])
+                for t in missing:
+                    name = t.rsplit("/", 1)[1]
+                    title = _doc_title(os.path.join(base, t),
+                                       os.path.splitext(name)[0])
+                    out.append("- [%s](%s)" % (title, t))
+                added += len(missing)
+            if out != lines or not existed:
+                _write_lines(ipath, out)
+    return created, added, dropped
+
+
 def reconcile_navigation(docs_root):
-    """Guarantee navigation coverage of the hub: add a link entry for every
-    functions/ or design/ doc not linked anywhere in PROJECT.md (entry text =
-    the doc's first heading), drop entries whose target doc no longer exists,
-    and re-create a navigation section whose heading was dropped entirely
-    (anchored above Sync Status, holding the orphaned links or the template
-    placeholder). Returns a one-line change summary, '' when the hub is
-    already complete."""
+    """Guarantee navigation coverage at both tiers: (1) module indexes cover
+    their module docs (files created/linked deterministically), (2) PROJECT.md
+    links every module index and every flat doc, drops entries whose target
+    doc no longer exists, and re-creates a navigation section whose heading
+    was dropped entirely (anchored above Sync Status, holding the orphaned
+    links or the template placeholder). Returns a one-line change summary, ''
+    when everything is already complete."""
+    inv = docs_inventory(docs_root)
+    created_idx, idx_added, idx_dropped = _reconcile_module_indexes(docs_root, inv)
+
     lines = _read_lines(os.path.join(docs_root, HUB))
     if lines is None:
-        return ""
+        lines = []
+    # refresh the inventory AFTER index creation so indexes are linkable
+    inv = docs_inventory(docs_root)
 
     linked = {t for line in lines for t in _link_targets(line, docs_root)}
     missing = {}
-    for directory in sorted(DOCS_TOP_DIRS):
-        names = []
-        dpath = os.path.join(docs_root, directory)
-        if os.path.isdir(dpath):
-            for name in sorted(os.listdir(dpath)):
-                if not name.startswith(".") and name.lower().endswith(".md"):
-                    names.append(name)
-        missing[directory] = ["%s/%s" % (directory, name) for name in names
-                              if "%s/%s" % (directory, name) not in linked]
+    for directory, entry in inv.items():
+        wanted = ["%s/%s" % (directory, name) for name in entry["flat"]
+                  if "%s/%s" % (directory, name) not in linked]
+        wanted += ["%s/%s.md" % (directory, module) for module in entry["modules"]
+                   if "%s/%s.md" % (directory, module) not in linked]
+        missing[directory] = wanted
     # map every line to the navigation section (docs directory) it sits in;
     # any heading or a --- separator closes the current section
     section_of = []
@@ -247,20 +316,27 @@ def reconcile_navigation(docs_root):
     for index, block in sorted(blocks, key=lambda b: b[0], reverse=True):
         out[index:index] = block
 
-    if not (added or dropped or created):
+    summary_parts = []
+    if created_idx:
+        summary_parts.append("module indexes: %d created" % created_idx)
+    if idx_added or idx_dropped:
+        summary_parts.append("module index entries: %+d, -%d dead"
+                             % (idx_added, idx_dropped))
+    if added or dropped or created:
+        if out != lines:
+            _write_lines(os.path.join(docs_root, HUB), out)
+        summary_parts.append("hub: %+d link(s), -%d dead link(s)" % (added, dropped))
+        if created:
+            summary_parts.append("created section(s): %s" % "/".join(created))
+        if orphan_left:
+            summary_parts.append("(%d orphan doc(s) left - no matching section "
+                                 "heading)" % orphan_left)
+    if not summary_parts:
         if orphan_left:
             return ("navigation: %d orphan doc(s) left - no matching section "
                     "heading to anchor entries" % orphan_left)
         return ""
-    with open(os.path.join(docs_root, HUB), "w", encoding="utf-8") as fh:
-        fh.write("\n".join(out) + "\n")
-    summary = "navigation: %+d link(s), -%d dead link(s)" % (added, dropped)
-    if created:
-        summary += ", created section(s): %s" % "/".join(created)
-    if orphan_left:
-        summary += (" (%d orphan doc(s) left - no matching section heading)"
-                    % orphan_left)
-    return summary
+    return "navigation: " + "; ".join(summary_parts)
 
 
 def main(argv=None):

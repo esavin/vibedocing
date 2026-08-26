@@ -8,6 +8,8 @@
 
   "docs_root": "agent/project",
 
+  "modules": @@MODULES@@,
+
   "use_worktree": true,
   "skip_merges": true,
 
@@ -45,6 +47,13 @@
     "retries": 0
   },
 
+  "snapshot": {
+    "$comment": "Snapshot bootstrap (run.sh --snapshot [REF]): document the CURRENT tree at REF (default HEAD) instead of replaying history - one planner request partitions the tree into modules, then one agent session per module writes its initial docs. The baseline jumps to REF; later runs replay only newer commits. planner_model: model for the one planner request ('' = llm.model). max_modules: cap on the module partition (excess merges into 'misc'). max_steps: per-module session step budget (0 = llm.max_steps_initial).",
+    "planner_model": "",
+    "max_modules": 40,
+    "max_steps": 0
+  },
+
   "validation": {
     "$comment": "post-write docs validation. mode: strict = remaining errors flip the verdict to ERROR (commit retried); warn = report only; off. rounds: how many repair rounds the agent gets before the final verdict. path_check: severity of the 'cited repo path must exist in the worktree' check.",
     "mode": "strict",
@@ -69,6 +78,7 @@
     "max_steps_cap": 48,
     "request_timeout_seconds": 180,
     "retries": 5,
+    "heartbeat_seconds": 60,
     "extra_body": {},
     "log_transcript": true
   }

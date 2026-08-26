@@ -45,7 +45,11 @@ on top of `max_steps`, capped here: a 34-file move commit needs more write round
 than a one-liner), `request_timeout_seconds` (per HTTP request, default 180),
 `retries` (default 5; exponential backoff, honors `Retry-After`), `temperature`
 and `max_tokens` (omitted when null/0 — some strict gateways/models reject
-explicit values), `log_transcript` (default true — write the full LLM interaction
+explicit values), `heartbeat_seconds` (default 60 — one
+`[llm] waiting for <model>: Ns` line per interval while a single request is in
+flight, plus a line before each retry backoff; set 0 to silence. Reasoning
+models regularly take minutes per round-trip — without it the pipeline looks
+hung), `log_transcript` (default true — write the full LLM interaction
 log per commit, see Troubleshooting below).
 
 Built-in loop guardrails (observed on weak models, fernflower runs): exact
@@ -102,6 +106,68 @@ later commits refine the map idempotently. To chunk a huge first pass further, s
 `scope` in config to a subdirectory (pathspec filter on which commits are processed)
 and run multiple passes.
 
+## Snapshot bootstrap instead of full replay (--snapshot)
+For histories of thousands+ commits, replay is rarely worth its cost: the final map
+describes the CURRENT tree anyway, and the history's dense middle mostly aggregates
+away. `run.sh --snapshot [REF]` inverts the process:
+
+1. The tree at REF (default HEAD) is checked out into a worktree; a **planner**
+   request (one cheap LLM call, no tools; `snapshot.planner_model`, defaults to
+   `llm.model`) partitions the tree digest into modules. A mechanical
+   top-level-directory partition (second level when one directory dominates —
+   opencv-style `modules/<name>`) is the automatic fallback when the planner
+   fails or returns garbage.
+2. One full agent session **per module** documents that module: module index +
+   capability-cluster function docs + at most a couple of design docs, with the
+   regular guarded toolset, validation and repair rounds. Per-module context
+   stays small at any repository size — the snapshot cannot blow the window.
+3. `run.sh` sets the committed baseline to REF (`.vibedocing.json` gains a
+   `"snapshot"` marker) and commits the map. Later regular runs replay only
+   commits newer than the snapshot.
+
+Interrupted snapshots resume: per-module markers
+`vibedocing/verdicts/<sha>~snapshot~<module>.json` let a re-run skip finished
+modules (pass `--fresh` to `python3 -m vibe_agent.snapshot` to force re-running
+everything). Strict final validation covers the whole map
+(`<sha>~snapshot.validation.md`).
+
+Snapshot progress streams live to the terminal (planner status, `module <name>
+(i/N)` lines, per-step tool results, and an LLM heartbeat during long
+round-trips); the same output is kept in `logs/snapshot-<sha>.log`.
+
+Typical cost: (modules + 1) agent sessions instead of tens of thousands — a
+30k-commit repository maps in hours, not weeks. Combine with the module layout
+below; snapshot sessions always file docs per module when `modules` is on.
+
+## Module-grouped docs layout (large maps)
+A flat `functions/` directory and a hub listing every doc stop scaling past a
+few hundred docs: the hub is fully rewritten per documented commit, and the
+per-commit docs overview injected into the agent grows without bound. With
+`"modules": true` in config (bootstrap enables it automatically at 2000+
+commits):
+
+- docs live in `functions/<module>/<number>-<name>.md` behind an index
+  `functions/<module>.md` (overview + `## Documents` links); each module
+  numbers its docs from 01;
+- the hub links module indexes, indexes link docs — the deterministic
+  self-heal (hub.py) works at both tiers: missing indexes are re-created as
+  skeletons, missing doc entries appended, dead links dropped;
+- the injected docs overview is module-level (`functions/gpu.md — GPU Module
+  [3 doc(s) live under gpu/]`), so the agent reads ONE index to decide
+  NEW vs UPDATE instead of a thousand-line map;
+- granularity floor (enforced by prompt): one doc per capability CLUSTER
+  (`01-arithmetics.md` covering add/sub/mul), not per symbol — this is what
+  keeps the map in the hundreds, not thousands, of files;
+- the flat layout stays fully valid at any time — `parse_doc_path`, the
+  validators, the write-time layout guard and the hub all accept both forms
+  side by side, so an existing workspace can switch `"modules": true`
+  mid-run and migrate gradually (legacy flat docs keep their hub links,
+  new docs land in modules).
+
+To migrate an already-replayed workspace: flip `"modules": true` in config and
+keep running; or re-bootstrap and `--snapshot` the current tree for a clean
+modular map in one pass.
+
 ## Renames, moves, deletions (path hygiene)
 Every commit's first message includes a rename-aware name-status; when existing docs
 cite paths renamed/deleted by the commit, the agent gets a precomputed STALE DOC
@@ -140,6 +206,12 @@ After every DOC_UPDATED verdict the docs map is validated mechanically (config
 - audit an existing docs map any time: `./vibedocing/run.sh --validate [sha]`.
 
 ## Performance / cost
+- **Snapshot first for big histories**: `--snapshot` documents the current tree in
+  (modules + 1) sessions; replay is then only ever needed for NEW commits. See
+  "Snapshot bootstrap instead of full replay".
+- **Module layout keeps per-commit cost flat**: the injected docs overview stays
+  module-level no matter how many docs exist, and the hub is never rewritten
+  wholesale to list every doc. See "Module-grouped docs layout".
 - Tune `commit_skip_regex` with `--list` first — a good filter avoids most agent calls.
   `bootstrap.sh` picks the pattern from the project's history: conventional-commit
   prefixes (`fix:`, `chore(`, …) when ≥10% of recent subjects use them, otherwise a
@@ -250,6 +322,9 @@ identity defaults to `vibedocing <vibedocing@local>` (set in config / by bootstr
 ## Runtime files (gitignored)
 - `vibedocing/progress.json` — processed[] + counters (fast in-walk resume).
 - `vibedocing/walk.log`, `vibedocing/logs/<sha>.log`, `vibedocing/verdicts/<sha>.{txt,json}`.
+- `vibedocing/logs/snapshot-<short>.log`, `vibedocing/verdicts/<sha>~snapshot.{txt,json}`
+  and `vibedocing/verdicts/<sha>~snapshot~<module>.json` — snapshot bootstrap log,
+  aggregate verdict and per-module resume markers.
 - `vibedocing/verdicts/<sha>.transcript.jsonl` — full LLM interaction log for that
   commit: every model response (content, tool calls, `finish_reason`, per-step token
   usage) and every tool result exactly as it was fed back. Replay order = the exact
@@ -263,16 +338,18 @@ identity defaults to `vibedocing <vibedocing@local>` (set in config / by bootstr
 - `tools.py` — the six tools with **code-level guards**: git restricted to
   `show|log|diff|ls-tree|grep` (scrubbed GIT_* env, no pager, no `-c`/`--output`),
   reads confined to the worktree/docs root, `search_docs` (regex over the docs root),
-  writes confined to `.md` under the docs root.
+  writes confined to `.md` under the docs root (flat or module-grouped layout).
 - `prompt.py` — compact system prompt + grounded first message (commit meta,
   rename-aware name-status, stale-doc worklist, tree digest for root commits,
-  conventions).
+  conventions); module-level docs overview/numbering; snapshot session prompts.
 - `agent.py` — the loop; ends only via the `finish` tool; supports validation-driven
   repair rounds.
+- `snapshot.py` — the snapshot bootstrap CLI (`run.sh --snapshot`): planner request,
+  mechanical fallback partition, one module session each, per-module resume markers.
 - `validate.py` — the mechanical docs validator (also a standalone CLI).
-- `hub.py` — deterministic PROJECT.md maintenance: Sync Status bullets and full
-  navigation coverage (after each processed commit it re-adds links for docs the
-  agent's hub rewrites dropped and removes links to deleted docs).
+- `hub.py` — deterministic PROJECT.md + module index maintenance: Sync Status bullets
+  and two-tier navigation coverage (after each processed commit it re-adds links for
+  docs the agent's rewrites dropped and removes links to deleted docs).
 
 You can run one step standalone (as `run.sh` does):
 ```bash

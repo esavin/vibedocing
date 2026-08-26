@@ -23,6 +23,10 @@ under review.
 > `design/` — nothing else. Do not create any other files or subfolders, do not nest a
 > copy of the docs root inside itself (no `agent/` or `project/` subfolder), and do not
 > mirror the source tree's directory names (no `<source-root>/functions/...`).
+> Inside `functions/` and `design/` two coexisting forms are allowed: **flat**
+> (`<number>-<name>.md`) and **module-grouped** (`<module>.md` index plus a
+> `<module>/` directory holding that module's numbered docs) — see *Module layout*
+> below.
 
 > **Path resolution:** the locations below are written relative to the *repository
 > root* (`agent/project/...`) for human readers. When the pipeline's agent writes docs
@@ -34,6 +38,11 @@ under review.
 > - **Incremental (per-commit)** — driven by the pipeline's `run.sh`, which replays
 >   the project commit-by-commit (stateful replay) and invokes the built-in
 >   `vibe-agent` CLI for each. See *Incremental mode* below.
+> - **Snapshot bootstrap** — `run.sh --snapshot` skips the history entirely: a
+>   planner request partitions the current tree into modules, one agent session
+>   per module writes that module's initial docs, and the baseline jumps to the
+>   snapshot commit (later runs replay only newer commits). Recommended for
+>   histories of thousands+ commits.
 > - **Manual** — a human or agent edits docs directly following the same rules.
 
 ## Core Goal
@@ -61,10 +70,13 @@ links to all design docs; key entry-point source references.
 new function/design doc is added (to keep navigation complete).
 
 ### Level 2 — Function Documentation
-**Location:** `agent/project/functions/*.md`
+**Location:** `agent/project/functions/*.md` (flat) or `agent/project/functions/<module>/*.md` (module-grouped)
 **Naming:** `<number>-<function-name>.md` (e.g. `01-cli.md`, `08-tools.md`). Numbers keep
-the index stable; reuse the lowest free number for new files.
+the index stable; reuse the lowest free number for new files. Each module directory
+carries its own numbering from 01.
 **Purpose:** Describe each **user-facing capability / function** — *what* it does.
+**Granularity:** one doc per capability CLUSTER, not per function symbol — related
+functions share a doc; only standalone marquee features get their own.
 **Template:**
 ```markdown
 # <Function Name> Function
@@ -290,11 +302,39 @@ helper class is not a function (it belongs in a design doc, if anywhere).
     ├── update-documents.md        # this generic methodology
     ├── project-conventions.md     # per-project specifics (language, paths, branch, areas)
     ├── PROJECT.md                 # Level 1: navigation hub
-    ├── functions/                 # Level 2: function docs (only *.md, one level deep)
-    └── design/                    # Level 3: technical design docs (only *.md, one level deep)
+    ├── functions/                 # Level 2: function docs (only *.md)
+    │   ├── 01-cli.md              #   flat form
+    │   ├── gpu.md                 #   module index (module-grouped form)
+    │   └── gpu/                   #   the gpu module's numbered docs
+    └── design/                    # Level 3: technical design docs (same two forms)
 ```
 
-No other files or subfolders belong under the docs root.
+No other files or subfolders belong under the docs root (module directories under
+`functions/` / `design/` are the one sanctioned nesting level).
+
+## Module layout (optional, recommended for large projects)
+
+When the workspace config sets `"modules": true` (bootstrap enables it automatically
+for histories of 2000+ commits), new docs are grouped per module:
+
+- `functions/<module>.md` is the module **index**: a short overview plus a
+  `## Documents` section linking every doc of the module.
+- The module's docs live in `functions/<module>/<number>-<name>.md`, numbered
+  per module directory from 01.
+- `PROJECT.md`'s navigation sections link **module indexes** (and any legacy flat
+  docs), never individual module docs: hub → index → docs. The pipeline heals
+  both tiers deterministically after every processed commit.
+- Flat docs created before the switch stay valid; do not renumber them.
+
+## Snapshot bootstrap mode
+
+`run.sh --snapshot [REF]` documents the **current tree** at REF (default HEAD)
+instead of replaying history: one planner request partitions the tree into
+modules, then one agent session per module writes that module's initial docs
+(module index + capability-cluster function docs + at most a couple of design
+docs). The committed baseline then jumps to REF, and subsequent regular runs
+document only newer commits. An interrupted snapshot resumes where it stopped
+(finished modules are skipped on re-run).
 
 ## DO / DON'T
 **DO:** update timestamps; link related docs; use repository-root-relative source paths;

@@ -8,6 +8,7 @@ plain POST with retries is all that is needed. Swapping this module for the
 import json
 import random
 import re
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -67,9 +68,47 @@ def _context_limit(detail):
     return int(match.group(1)) if match else None
 
 
+def _log(message):
+    print("[llm] %s" % message, flush=True)
+
+
+class _Heartbeat(object):
+    """Prints a periodic line while an LLM request is in flight.
+
+    A single round-trip on a reasoning model (or a retry backoff during a
+    provider outage) regularly runs minutes with no other output - from the
+    outside that is indistinguishable from a hang. A daemon thread emits one
+    line per `interval` seconds; `interval <= 0` disables the heartbeat.
+    """
+
+    def __init__(self, model, interval):
+        self._model = model
+        self._interval = max(0, int(interval or 0))
+        self._stop = threading.Event()
+        self._thread = None
+        self._start = time.monotonic()
+
+    def __enter__(self):
+        if self._interval > 0:
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+        return self
+
+    def _run(self):
+        while not self._stop.wait(self._interval):
+            _log("waiting for %s: %ds" % (self._model,
+                                          int(time.monotonic() - self._start)))
+
+    def __exit__(self, exc_type, exc, tb):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+
+
 class ChatClient(object):
     def __init__(self, base_url, api_key, model, timeout=180, retries=4,
-                 temperature=None, max_tokens=0, extra_body=None):
+                 temperature=None, max_tokens=0, extra_body=None,
+                 heartbeat_seconds=60):
         self.url = base_url.rstrip("/") + "/chat/completions"
         self.api_key = api_key or ""
         self.model = model
@@ -78,6 +117,7 @@ class ChatClient(object):
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.extra_body = dict(extra_body or {})
+        self.heartbeat_seconds = max(0, int(heartbeat_seconds or 0))
 
     # -- public -------------------------------------------------------------
 
@@ -101,7 +141,8 @@ class ChatClient(object):
             if self.api_key:
                 request.add_header("Authorization", "Bearer " + self.api_key)
             try:
-                with urllib.request.urlopen(request, timeout=self.timeout) as resp:
+                with _Heartbeat(self.model, self.heartbeat_seconds), \
+                        urllib.request.urlopen(request, timeout=self.timeout) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
                 return self._parse(data)
             except urllib.error.HTTPError as exc:
@@ -112,15 +153,22 @@ class ChatClient(object):
                         _context_limit(detail))
                 if exc.code in RETRYABLE_HTTP and attempt < self.retries:
                     last_error = "HTTP %d: %s" % (exc.code, detail)
-                    time.sleep(self._backoff(attempt,
-                                             exc.headers.get("Retry-After"),
-                                             http=True))
+                    delay = self._backoff(attempt,
+                                          exc.headers.get("Retry-After"),
+                                          http=True)
+                    _log("HTTP %d from %s - retry %d/%d in %.0fs"
+                         % (exc.code, self.model, attempt + 1, self.retries,
+                            delay))
+                    time.sleep(delay)
                     continue
                 raise FatalLLMError("HTTP %d from %s: %s" % (exc.code, self.url, detail))
             except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
                 if attempt < self.retries:
                     last_error = "connection error: %s" % exc
-                    time.sleep(self._backoff(attempt, None))
+                    delay = self._backoff(attempt, None)
+                    _log("connection error (%s) - retry %d/%d in %.0fs"
+                         % (exc, attempt + 1, self.retries, delay))
+                    time.sleep(delay)
                     continue
                 raise FatalLLMError("connection error (retries exhausted): %s" % exc)
             except json.JSONDecodeError as exc:

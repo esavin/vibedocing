@@ -22,11 +22,13 @@ import os
 import sys
 
 from .agent import run_agent
-from .config import ConfigError, load_config, resolve_llm, resolve_limits
+from .config import (ConfigError, load_config, resolve_llm, resolve_limits,
+                     resolve_modules)
 from .hygiene import hygiene_plan
 from .llm import ChatClient, FatalLLMError
 from .prompt import (InspectError, SYSTEM_PROMPT, build_first_user,
-                     build_reconsider_message, load_prior_hint, sha_looks_valid)
+                     build_reconsider_message, load_prior_hint, sha_looks_valid,
+                     system_prompt)
 from .tools import ToolSet
 from .transcript import Transcript
 from .validate import format_report, repair_message, validate_docs
@@ -147,6 +149,7 @@ def main(argv=None):
     today = datetime.date.today().isoformat()
     val_mode, val_rounds, path_check = validation_settings(config,
                                                            args.classify_only)
+    sys_prompt = system_prompt(resolve_modules(config))
 
     tools = ToolSet(worktree, docs_root, classify_only=args.classify_only,
                     limits=limits)
@@ -159,6 +162,7 @@ def main(argv=None):
         temperature=llm["temperature"],
         max_tokens=llm["max_tokens"],
         extra_body=llm["extra_body"],
+        heartbeat_seconds=llm["heartbeat_seconds"],
     )
 
     transcript = None
@@ -294,7 +298,7 @@ def main(argv=None):
                 "repair_rounds": val_rounds,
                 "limits_profile": limits["profile"],
                 "compact_threshold_tokens": limits["compact_threshold_tokens"],
-                "system_prompt_chars": len(SYSTEM_PROMPT),
+                "system_prompt_chars": len(sys_prompt),
                 "first_user_chars": len(first_user),
             }
             if extra:
@@ -324,7 +328,7 @@ def main(argv=None):
                 log("hygiene batch %d/%d: %s" % (index + 1, len(batches),
                                                  ", ".join(batch_docs)))
                 session_verdicts.append(run_agent(
-                    client, batch_tools, SYSTEM_PROMPT, focus_user,
+                    client, batch_tools, sys_prompt, focus_user,
                     llm["max_steps"], log,
                     validator=lambda docs=batch_docs: validator(docs),
                     repair_rounds=val_rounds, transcript=transcript,
@@ -338,7 +342,7 @@ def main(argv=None):
                 first_user, _info = build_first_user(
                     args.sha, worktree, docs_root, mode, today,
                     read_conventions(docs_root), limits=limits)
-            verdict = run_agent(client, tools, SYSTEM_PROMPT, first_user,
+            verdict = run_agent(client, tools, sys_prompt, first_user,
                                 max_steps, log,
                                 validator=validator, repair_rounds=val_rounds,
                                 transcript=transcript, reconsider=reconsider,

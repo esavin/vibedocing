@@ -7,32 +7,43 @@ memory, and docs that silently lost their PROJECT.md navigation entry. All of th
 are mechanically checkable, so the pipeline now validates after every doc-writing
 commit and feeds the problems back to the agent for repair.
 
+Docs layout - two coexisting forms (a workspace may migrate from one to the other):
+  flat     functions/<number>-<name>.md                  design/<number>-<name>.md
+  modular  functions/<module>.md  (module INDEX)         design/<module>.md
+           functions/<module>/<number>-<name>.md         design/<module>/<number>-<name>.md
+The modular form scales to thousands of docs: PROJECT.md links module indexes,
+each index links its module's docs. Numbering is per-directory (top level or
+module dir), so two modules may both use 01-.
+
 Checks:
- 1. layout - the docs root contains only the fixed top-level entries
-             (PROJECT.md, update-documents.md, project-conventions.md, functions/,
-              design/, dotfiles like .vibedocing.json).
- 2. naming - files in functions/ and design/ match <number>-<name>.md; numbers are
-             unique per directory (duplicates are errors; numbering gaps are warnings).
- 3. links  - every relative markdown link resolves to an existing file under the
-             docs root (http(s)/mailto/anchor targets are skipped).
- 4. paths  - repository-path-like references (contain "/" and a file extension, no
-             placeholder markers) resolve inside the worktree = the repository at the
-             commit being documented. Catches stale prefixes such as "<clone>/src/..."
-             and citations of files that no longer exist.
- 5. stale  - no doc still cites a path renamed/deleted by the commit under review
-             (old paths come from the rename-aware name-status of this commit).
- 6. orphans - every functions/ and design/ doc is linked from PROJECT.md (the
-              reverse direction of the links check). Warnings only: the
-              pipeline's hub reconciliation (vibe_agent/hub.py) re-adds missing
-              links itself after each processed commit, so this is a drift
-              signal, not a repair task for the agent.
- 7. hub sections - PROJECT.md keeps BOTH fixed navigation sections (## Function
-              Documentation, ## Technical Design Documents). A dropped section
-              heading leaves every later doc of that level without an anchor
-              (a real run lost the functions section at the root commit and
-              all 255 documented commits then went to design/). Errors: the
-              heading is trivial to restore in a repair round, and hub.py
-              re-creates a missing section deterministically as a safety net.
+  1. layout - the docs root contains only the fixed top-level entries
+              (PROJECT.md, update-documents.md, project-conventions.md, functions/,
+               design/, dotfiles like .vibedocing.json).
+  2. naming - files in functions/ and design/ match <number>-<name>.md (or are a
+               module index <module>.md with a matching <module>/ directory);
+               numbers are unique per directory (duplicates are errors; numbering
+               gaps are warnings).
+  3. links  - every relative markdown link resolves to an existing file under the
+              docs root (http(s)/mailto/anchor targets are skipped).
+  4. paths  - repository-path-like references (contain "/" and a file extension, no
+              placeholder markers) resolve inside the worktree = the repository at the
+              commit being documented. Catches stale prefixes such as "<clone>/src/..."
+              and citations of files that no longer exist.
+  5. stale  - no doc still cites a path renamed/deleted by the commit under review
+              (old paths come from the rename-aware name-status of this commit).
+  6. orphans - every functions/ and design/ doc is reachable: flat docs and module
+               indexes from PROJECT.md, module docs from their module index (or
+               PROJECT.md). Warnings only: the pipeline's hub reconciliation
+               (vibe_agent/hub.py) re-adds missing links itself after each
+               processed commit, so this is a drift signal, not a repair task
+               for the agent.
+  7. hub sections - PROJECT.md keeps BOTH fixed navigation sections (## Function
+               Documentation, ## Technical Design Documents). A dropped section
+               heading leaves every later doc of that level without an anchor
+               (a real run lost the functions section at the root commit and
+               all 255 documented commits then went to design/). Errors: the
+               heading is trivial to restore in a repair round, and hub.py
+               re-creates a missing section deterministically as a safety net.
 
 Severities: errors are deterministic and block publication in strict mode; warnings
 are heuristics recorded in the report. Usable standalone:
@@ -48,6 +59,69 @@ import sys
 
 DOCS_TOP_FILES = {"project.md", "update-documents.md", "project-conventions.md"}
 DOCS_TOP_DIRS = {"functions", "design"}
+
+# module directory / index slug: lowercase, digits, dashes, underscores
+MODULE_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+
+
+def parse_doc_path(rel):
+    """Parse a docs-root-relative path under functions/ or design/.
+
+    Returns None for anything else, else a dict:
+      functions/01-x.md     -> {"top": "functions", "module": None,  "file": "01-x.md",
+                                "index": False}
+      functions/gpu.md      -> {"top": "functions", "module": "gpu", "file": "gpu.md",
+                                "index": True}   (module INDEX file)
+      functions/gpu/01-x.md -> {"top": "functions", "module": "gpu", "file": "01-x.md",
+                                "index": False}  (doc inside module dir)
+    """
+    parts = [p for p in str(rel).replace("\\", "/").split("/")
+             if p not in ("", ".")]
+    if len(parts) == 2:
+        top, name = parts[0].lower(), parts[1]
+        if top not in DOCS_TOP_DIRS or not name.lower().endswith(".md"):
+            return None
+        if _NUMBER_RE.match(name):
+            return {"top": top, "module": None, "file": name, "index": False}
+        stem = name[:-3].lower()
+        if stem and MODULE_SLUG_RE.match(stem):
+            return {"top": top, "module": stem, "file": stem + ".md", "index": True}
+        return None
+    if len(parts) == 3:
+        top, module, name = parts[0].lower(), parts[1].lower(), parts[2]
+        if (top not in DOCS_TOP_DIRS or not MODULE_SLUG_RE.match(module)
+                or not name.lower().endswith(".md") or not _NUMBER_RE.match(name)):
+            return None
+        return {"top": top, "module": module, "file": name, "index": False}
+    return None
+
+
+def docs_inventory(docs_root):
+    """Structural inventory of the docs map (flat + modular forms).
+
+    Returns {top: {"flat": [numbered file names], "modules": {slug: [doc names]}}}
+    for both docs directories. Anything that does not parse (weird names, stray
+    files) is simply absent here - check_naming reports it.
+    """
+    inv = {}
+    for top in sorted(DOCS_TOP_DIRS):
+        base = os.path.join(docs_root, top)
+        entry = {"flat": [], "modules": {}}
+        if os.path.isdir(base):
+            for name in sorted(os.listdir(base)):
+                if name.startswith("."):
+                    continue
+                path = os.path.join(base, name)
+                if os.path.isdir(path):
+                    if MODULE_SLUG_RE.match(name):
+                        entry["modules"][name] = sorted(
+                            fn for fn in os.listdir(path)
+                            if fn.lower().endswith(".md")
+                            and _NUMBER_RE.match(fn))
+                elif name.lower().endswith(".md") and _NUMBER_RE.match(name):
+                    entry["flat"].append(name)
+        inv[top] = entry
+    return inv
 
 _HEADING_RE = re.compile(r"^#{1,6}\s+(.*)$")
 # navigation sections of PROJECT.md are located by a substring of their heading
@@ -100,51 +174,100 @@ def check_layout(docs_root, errors):
                           % (name, ", ".join(sorted(allowed))))
 
 
+def _check_numbered_set(directory, names, errors, warnings):
+    """Uniqueness/gap checks for one directory's <number>-<name>.md files."""
+    numbers = {}
+    for name in names:
+        match = _NUMBER_RE.match(name)
+        if not match:
+            continue
+        number = match.group(1)
+        if len(number) < 2:
+            errors.append(
+                "naming: %s/%s uses an unpadded number - the fixed layout "
+                "numbers docs with TWO digits. Re-save the doc as "
+                "'%s/%02d-%s' (a single write_doc to that path replaces "
+                "the unpadded file automatically)"
+                % (directory, name, directory, int(number),
+                   name[match.end():]))
+        numbers.setdefault(int(number), []).append(name)
+    for number, dupes in sorted(numbers.items()):
+        if len(dupes) > 1:
+            errors.append(
+                "naming: duplicate number %02d in %s/: %s. Keep ONE of these "
+                "files (merge the content if both have value) and DELETE the "
+                "others with write_doc({\"path\": \"%s/<file>\", "
+                "\"delete\": true}). Do NOT create yet another numbered file "
+                "for this topic."
+                % (number, directory, ", ".join(dupes), directory))
+    if numbers:
+        highest = max(numbers)
+        if highest > len(numbers):
+            warnings.append(
+                "naming: numbering gap in %s/ - highest number %03d but only %d "
+                "numbered docs; reuse the lowest free number for new docs"
+                % (directory, highest, len(numbers)))
+
+
 def check_naming(docs_root, errors, warnings):
     for directory in sorted(DOCS_TOP_DIRS):
         path = os.path.join(docs_root, directory)
         if not os.path.isdir(path):
             continue
-        numbers = {}
-        count = 0
+        flat = []
+        module_dirs = []
         for name in sorted(os.listdir(path)):
+            if name.startswith("."):
+                continue
+            full = os.path.join(path, name)
+            if os.path.isdir(full):
+                if MODULE_SLUG_RE.match(name):
+                    module_dirs.append(name)
+                else:
+                    errors.append(
+                        "naming: %s/%s is not a valid module directory name "
+                        "(lowercase letters/digits/dashes/underscores)"
+                        % (directory, name))
+                continue
             if not name.lower().endswith(".md"):
                 errors.append("naming: %s/%s is not a .md file" % (directory, name))
                 continue
-            if name.startswith("."):
-                continue
-            count += 1
             match = _NUMBER_RE.match(name)
-            if not match:
-                errors.append("naming: %s/%s lacks the <number>-<name>.md pattern"
-                              % (directory, name))
-                continue
-            number = match.group(1)
-            if len(number) < 2:
+            if match:
+                flat.append(name)
+            elif MODULE_SLUG_RE.match(name[:-3].lower()) and len(name) > 3:
+                # module index: needs its module directory (healed by hub.py)
+                if not os.path.isdir(os.path.join(path, name[:-3].lower())):
+                    warnings.append(
+                        "naming: %s/%s looks like a module index but the "
+                        "module directory %s/%s/ does not exist"
+                        % (directory, name, directory, name[:-3].lower()))
+            else:
                 errors.append(
-                    "naming: %s/%s uses an unpadded number - the fixed layout "
-                    "numbers docs with TWO digits. Re-save the doc as "
-                    "'%s/%02d-%s' (a single write_doc to that path replaces "
-                    "the unpadded file automatically)"
-                    % (directory, name, directory, int(number),
-                       name[match.end():]))
-            numbers.setdefault(int(number), []).append(name)
-        for number, names in sorted(numbers.items()):
-            if len(names) > 1:
-                errors.append(
-                    "naming: duplicate number %02d in %s/: %s. Keep ONE of these "
-                    "files (merge the content if both have value) and DELETE the "
-                    "others with write_doc({\"path\": \"%s/<file>\", "
-                    "\"delete\": true}). Do NOT create yet another numbered file "
-                    "for this topic."
-                    % (number, directory, ", ".join(names), directory))
-        if numbers:
-            highest = max(int(n) for n in numbers)
-            if highest > len(numbers):
+                    "naming: %s/%s is neither a <number>-<name>.md doc nor a "
+                    "module index (<module>.md)" % (directory, name))
+        _check_numbered_set(directory, flat, errors, warnings)
+        for module in module_dirs:
+            mpath = os.path.join(path, module)
+            mdocs = []
+            for name in sorted(os.listdir(mpath)):
+                if name.startswith("."):
+                    continue
+                if not name.lower().endswith(".md") or not _NUMBER_RE.match(name):
+                    errors.append(
+                        "naming: %s/%s/%s must follow the <number>-<name>.md "
+                        "pattern (module directories hold numbered docs only; "
+                        "the module index lives at %s/%s.md)"
+                        % (directory, module, name, directory, module))
+                    continue
+                mdocs.append(name)
+            if not os.path.isfile(os.path.join(path, module + ".md")):
                 warnings.append(
-                    "naming: numbering gap in %s/ - highest number %03d but only %d "
-                    "numbered docs; reuse the lowest free number for new docs"
-                    % (directory, highest, len(numbers)))
+                    "naming: module directory %s/%s/ has no index file - "
+                    "create %s/%s.md (the pipeline re-creates a skeleton "
+                    "itself)" % (directory, module, directory, module))
+            _check_numbered_set("%s/%s" % (directory, module), mdocs,
+                                errors, warnings)
 
 
 def check_links(docs_root, errors):
@@ -177,11 +300,18 @@ def _path_candidates(line):
         yield token
 
 
+# fixed methodology files use example paths ("e.g. src/path/to/file.ext") by
+# design - the source-path check targets agent-written capability docs
+PATH_CHECK_EXEMPT = {"update-documents.md", "project-conventions.md"}
+
+
 def check_paths(docs_root, worktree, problems, severity):
     if not worktree or not os.path.isdir(worktree) or severity == "off":
         return
     for path in _iter_md_files(docs_root):
         rel = _rel(path, docs_root)
+        if rel in PATH_CHECK_EXEMPT:
+            continue
         seen = set()
         for line in _read(path).splitlines():
             for token in _path_candidates(line):
@@ -214,10 +344,12 @@ def check_stale(docs_root, old_paths, errors):
 
 
 def check_orphans(docs_root, warnings):
-    """Reverse direction of check_links: every functions/ and design/ doc must
-    be reachable from PROJECT.md, the navigation hub. The agent rewrites the
-    hub per commit in a small context and old entries fall out (orphan drift);
-    this reports the drift. Warnings only - vibe_agent/hub.py heals them."""
+    """Reverse direction of check_links: navigation coverage. A flat doc and a
+    module INDEX must be reachable from PROJECT.md; a doc inside a module
+    directory must be reachable from its module index (or PROJECT.md). The
+    agent rewrites these files per commit in a small context and old entries
+    fall out (orphan drift); this reports the drift. Warnings only -
+    vibe_agent/hub.py heals them."""
     hub = os.path.join(docs_root, "PROJECT.md")
     if not os.path.isfile(hub):
         return
@@ -232,18 +364,41 @@ def check_orphans(docs_root, warnings):
         rel = os.path.relpath(os.path.normpath(os.path.join(docs_root, target)),
                               docs_root)
         linked.add(rel.replace(os.sep, "/"))
-    for directory in sorted(DOCS_TOP_DIRS):
-        path = os.path.join(docs_root, directory)
-        if not os.path.isdir(path):
-            continue
-        for name in sorted(os.listdir(path)):
-            if name.startswith(".") or not name.lower().endswith(".md"):
-                continue
+    for directory, entry in docs_inventory(docs_root).items():
+        for name in entry["flat"]:
             if "%s/%s" % (directory, name) not in linked:
                 warnings.append(
                     "%s/%s: not linked from PROJECT.md (navigation coverage; "
                     "the pipeline re-adds missing links itself after this "
                     "commit)" % (directory, name))
+        index_linked = {}
+        for module, names in entry["modules"].items():
+            ipath = os.path.join(docs_root, directory, module + ".md")
+            targets = set()
+            if os.path.isfile(ipath):
+                for match in _LINK_RE.finditer(_read(ipath)):
+                    target = match.group(2).strip()
+                    if not target or target.startswith(_SKIP_PREFIXES):
+                        continue
+                    target = target.split("#", 1)[0].split()[0]
+                    if not target:
+                        continue
+                    rel = os.path.relpath(os.path.normpath(
+                        os.path.join(docs_root, directory, target)), docs_root)
+                    targets.add(rel.replace(os.sep, "/"))
+            index_linked[module] = targets
+            if "%s/%s.md" % (directory, module) not in linked:
+                warnings.append(
+                    "%s/%s.md: module index not linked from PROJECT.md "
+                    "(navigation coverage; the pipeline re-adds missing links "
+                    "itself after this commit)" % (directory, module))
+            for name in names:
+                rel = "%s/%s/%s" % (directory, module, name)
+                if rel not in linked and rel not in targets:
+                    warnings.append(
+                        "%s: not linked from its module index %s/%s.md (the "
+                        "pipeline re-adds missing links itself after this "
+                        "commit)" % (rel, directory, module))
 
 
 def check_hub_sections(docs_root, errors):

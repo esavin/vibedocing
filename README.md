@@ -29,10 +29,14 @@ git clone <project-url> ./someproject
 
 # 4. point the agent at your model (any OpenAI-compatible endpoint)
 $EDITOR vibedocing/config.json        # llm.model, llm.base_url
-                                      # ~32k-context model? set limits.profile = "small"
+                                       # ~32k-context model? set limits.profile = "small"
 export VIBE_API_KEY=...               # or whatever llm.api_key_env names
 
-# 5. preview, then run
+# 5a. BIG HISTORY (thousands+ commits)? bootstrap from the current tree:
+./vibedocing/run.sh --snapshot         # module-by-module map of HEAD, then
+                                        # re-run after every pull for new commits
+
+# 5b. or replay the full history commit-by-commit:
 ./vibedocing/run.sh --list | tail -1     # how many commits to process
 ./vibedocing/run.sh --limit 20           # document first 20 commits (auto-committed)
 ./vibedocing/run.sh                      # continue from baseline to HEAD
@@ -50,8 +54,10 @@ mywork/                         <- workspace (its own git repo)
     update-documents.md         generic methodology
     project-conventions.md      per-project specifics (you edit this)
     .vibedocing.json              last-processed commit (for restart-after-sync)
-    functions/*.md              Level 2: user-facing capabilities
-    design/*.md                 Level 3: technical design
+    functions/*.md              Level 2: user-facing capabilities (flat form)
+    functions/<module>.md       Level 2: module index (module form)
+    functions/<module>/*.md     Level 2: that module's capability docs
+    design/*.md                 Level 3: technical design (same two forms)
 ```
 
 ## How it works (per commit)
@@ -91,6 +97,41 @@ mywork/                         <- workspace (its own git repo)
     self-heal — the agent's per-commit rewrites can drop old links or a whole
     section), and **git-commits** the doc changes
     (`docs(<project>): <subject>`).
+
+## Snapshot bootstrap for huge histories (--snapshot)
+
+Replaying 30k+ commits costs days-to-weeks of agent time. `--snapshot [REF]`
+builds the initial map from the **current tree** at REF (default HEAD) instead:
+
+1. One **planner** request (a single cheap LLM call) partitions the tree into
+   coherent modules; a mechanical top-level-directory partition is the fallback.
+2. One agent session **per module** writes that module's initial docs — module
+   index, capability-cluster function docs, at most a couple of design docs.
+   Small per-module contexts stay inside the model window at any repo size.
+3. The baseline jumps to REF; the next regular run documents only newer commits
+   (the incremental mode the pipeline is designed for).
+
+Interrupted snapshots **resume**: per-module markers (`verdicts/<sha>~snapshot~<module>.json`)
+let a re-run skip finished modules. Config: `snapshot.planner_model`,
+`snapshot.max_modules`, `snapshot.max_steps`. Progress streams live to the
+terminal (module counters, per-step tool results, an LLM heartbeat on long
+round-trips) and is also kept in `logs/snapshot-<sha>.log`.
+
+## Module-grouped docs layout (large maps)
+
+With `"modules": true` in config (bootstrap sets it automatically for histories
+of 2000+ commits), docs are grouped per module instead of one flat directory:
+
+- `functions/<module>.md` — module **index** (overview + links to its docs);
+- `functions/<module>/<number>-<name>.md` — the module's docs, numbered
+  per module from 01;
+- `PROJECT.md` links module indexes, each index links its docs
+  (hub → index → docs). The deterministic self-heal works at both tiers, and
+  the per-commit **docs overview injected into the agent is module-level** —
+  it stays small even with thousands of docs;
+- granularity floor: one doc per **capability cluster**, not per symbol;
+- the flat layout remains fully valid, so an existing workspace can migrate
+  gradually (legacy flat docs keep their hub links).
 
 ## Restart after upstream changes
 
@@ -159,6 +200,10 @@ visible in the verdict JSON (`"reconsidered": true`) and the transcript
 
 ```
 --list               show PROCESS/SKIP/DONE decisions, no agent calls
+--snapshot [REF]     bootstrap the map from the CURRENT tree at REF (default
+                     HEAD): planner partitions the tree into modules, one
+                     agent session per module; baseline jumps to REF. Resumes
+                     after interruption. Config snapshot.*
 --dry-run            classify only (no doc writes, no commits)
 --validate [SHA]     audit existing docs (links, numbering, paths, hub coverage) vs the tree at SHA
 --limit N            process at most N commits

@@ -16,6 +16,10 @@ LLM_DEFAULTS = {
     "max_steps_cap": 48,
     "request_timeout_seconds": 180,
     "retries": 5,
+    # one "[llm] waiting for <model>: Ns" line per N seconds an in-flight
+    # request runs (0 disables) - long reasoning round-trips otherwise look
+    # exactly like a hang
+    "heartbeat_seconds": 60,
     "extra_body": {},
     "log_transcript": True,
 }
@@ -93,6 +97,18 @@ CLASSIFIER_DEFAULTS = {
 }
 
 
+# Snapshot bootstrap (run.sh --snapshot): document the CURRENT tree instead
+# of replaying history, then replay only commits newer than the snapshot.
+# planner_model: model for the one-shot module-planner request ("" = llm.model).
+# max_modules: planner output cap - more modules than that merge into "misc".
+# max_steps: per-module session step budget (0 = llm.max_steps_initial).
+SNAPSHOT_DEFAULTS = {
+    "planner_model": "",
+    "max_modules": 40,
+    "max_steps": 0,
+}
+
+
 class ConfigError(Exception):
     """Fatal misconfiguration — the agent cannot start."""
 
@@ -140,6 +156,7 @@ def resolve_llm(config, cli_model=None, cli_max_steps=None):
         timeout = int(merged["request_timeout_seconds"])
         retries = int(merged["retries"])
         max_tokens = int(merged["max_tokens"] or 0)
+        heartbeat = max(0, int(merged["heartbeat_seconds"] or 0))
     except (TypeError, ValueError):
         raise ConfigError("llm numeric settings must be integers")
 
@@ -172,6 +189,7 @@ def resolve_llm(config, cli_model=None, cli_max_steps=None):
         "max_steps_cap": max(1, max_steps_cap),
         "timeout": max(30, timeout),
         "retries": max(0, retries),
+        "heartbeat_seconds": heartbeat,
         "extra_body": extra_body,
         "log_transcript": log_transcript,
     }
@@ -212,6 +230,38 @@ def resolve_limits(config):
         floor = 200 if key.endswith("_chars") else 0
         resolved[key] = max(floor, number)
     return resolved
+
+
+def resolve_modules(config):
+    """True when the module docs layout is enabled (config "modules": true).
+
+    The layout guard, validators and hub self-heal accept BOTH the flat and
+    the module forms regardless (so a workspace can migrate mid-run); this
+    flag only tells the agent's prompt to FILE new docs into modules and the
+    snapshot bootstrap to prefer modular output."""
+    value = config.get("modules")
+    if isinstance(value, str):
+        return value.strip().lower() not in ("false", "0", "no", "off", "")
+    return bool(value)
+
+
+def resolve_snapshot(config, llm):
+    """Merge the `snapshot` section over the resolved llm settings."""
+    section = config.get("snapshot")
+    if not isinstance(section, dict):
+        section = {}
+    merged = dict(SNAPSHOT_DEFAULTS)
+    merged.update({k: v for k, v in section.items() if v not in (None, "")})
+    try:
+        max_modules = max(1, int(merged["max_modules"]))
+        max_steps = max(0, int(merged["max_steps"]))
+    except (TypeError, ValueError):
+        raise ConfigError("snapshot numeric settings must be integers")
+    return {
+        "planner_model": str(merged["planner_model"] or llm["model"]),
+        "max_modules": max_modules,
+        "max_steps": max_steps,
+    }
 
 
 def resolve_classifier(config, llm):
@@ -260,4 +310,5 @@ def resolve_classifier(config, llm):
         "max_tokens": max_tokens,
         "timeout": max(30, timeout),
         "retries": max(0, retries),
+        "heartbeat_seconds": llm["heartbeat_seconds"],
     }

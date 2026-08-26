@@ -42,14 +42,19 @@ VERDICTS = {"DOC_UPDATED", "NO_DOC", "ERROR"}
 # exactly two subdirectories. This is enforced in code because models kept
 # re-prepending the docs-root prefix ('agent/project/functions/x.md') or
 # mirroring source-tree directories ('<source-root>/functions/x.md'), which
-# produced nested duplicate documentation trees.
+# produced nested duplicate documentation trees. Under functions/ and design/
+# two forms coexist: flat numbered docs (functions/<number>-<name>.md) and
+# module groups (functions/<module>.md index + functions/<module>/ docs).
 DOCS_TOP_FILES = {"project.md", "update-documents.md", "project-conventions.md"}
 DOCS_TOP_DIRS = {"functions", "design"}
 LAYOUT_ERROR = (
     "refused: the docs layout is fixed. Write only 'functions/<number>-<name>.md', "
-    "'design/<number>-<name>.md', 'PROJECT.md', 'project-conventions.md', or "
-    "'update-documents.md' - paths are relative to the docs root itself "
-    "(no 'agent/project/' prefix, no nested or source-mirroring folders). Got: '%s'"
+    "'design/<number>-<name>.md', 'functions/<module>/<number>-<name>.md', "
+    "'design/<module>/<number>-<name>.md', a module index "
+    "'functions/<module>.md' / 'design/<module>.md', 'PROJECT.md', "
+    "'project-conventions.md', or 'update-documents.md' - paths are relative "
+    "to the docs root itself (no 'agent/project/' prefix, no nested or "
+    "source-mirroring folders). Got: '%s'"
 )
 NUMBERING_HINT = ("<number> is always TWO digits with a hyphen: 01, 02, ... 10, 11 - "
                   "e.g. functions/01-cli.md")
@@ -191,14 +196,17 @@ class ToolSet(object):
                         "is docs-root-relative (or absolute inside the docs "
                         "root) and must follow the fixed layout: "
                         "functions/<number>-<name>.md, "
-                        "design/<number>-<name>.md, PROJECT.md, "
+                        "design/<number>-<name>.md, a module doc "
+                        "functions/<module>/<number>-<name>.md, a module "
+                        "index functions/<module>.md, PROJECT.md, "
                         "project-conventions.md, or update-documents.md "
                         "(<number> = two digits: 01, 02, ... - unpadded names "
                         "are normalized automatically). A NEW "
                         "numbered doc MUST take the lowest free number in ITS "
-                        "directory (checked at write time - the error names "
-                        "the exact expected path); never continue another "
-                        "directory's numbering. Never "
+                        "directory - flat docs share the functions/ counter, "
+                        "each module dir has its own (checked at write time - "
+                        "the error names "
+                        "the exact expected path). Never "
                         "prefix with agent/ or agent/project/ and never mirror "
                         "source-tree folders. Keep each call's content under "
                         "~150 lines: if a write gets cut off by the output "
@@ -528,8 +536,9 @@ class ToolSet(object):
         Strips accidental docs-root prefixes (a model told docs live in
         'agent/project/' may write 'agent/project/functions/x.md' or
         'project/functions/x.md') and rejects anything outside the documented
-        three-level structure.
+        structure (flat numbered docs, module indexes, module doc dirs).
         """
+        from .validate import parse_doc_path
         parts = [p for p in rel.split("/") if p not in ("", ".")]
         if not parts:
             return None
@@ -542,9 +551,15 @@ class ToolSet(object):
             parts.pop(0)
         if len(parts) == 1:
             return parts[0] if parts[0].lower() in DOCS_TOP_FILES else None
-        if len(parts) == 2 and parts[0].lower() in DOCS_TOP_DIRS:
-            return parts[0].lower() + "/" + parts[1]
-        return None
+        # normalize case of the docs directory and the module slug
+        parsed = parse_doc_path("/".join(parts))
+        if parsed is None:
+            return None
+        if parsed["module"] is None:
+            return "%s/%s" % (parsed["top"], parsed["file"])
+        if parsed["index"]:
+            return "%s/%s.md" % (parsed["top"], parsed["module"])
+        return "%s/%s/%s" % (parsed["top"], parsed["module"], parsed["file"])
 
     def _tool_write_doc(self, args):
         if self.classify_only:
@@ -581,61 +596,68 @@ class ToolSet(object):
         # the same doc is replaced after the write - the map never keeps both.
         unpadded_twin = None
         if "/" in rel and args.get("delete") is not True:
-            directory, _, fname = rel.partition("/")
-            match = _NUMBER_RE.match(fname)
-            if match:
-                number = int(match.group(1))
-                if number < 1:
-                    return {"ok": False,
-                            "error": "numbering: doc numbers start at 01"}
-                rest = fname[match.end():]
-                if len(match.group(1)) < 2:
-                    orig_rel = rel
-                    rel = "%s/%02d-%s" % (directory, number, rest)
-                    unpadded_twin = target
-                    target = os.path.join(self.docs_root, *rel.split("/"))
-                    note = ("%s; numbering normalized from '%s'"
-                            % (note, orig_rel)) if note else \
-                           ("numbering normalized from '%s'" % orig_rel)
-                # per-directory sequential numbering, enforced at write time
-                # for NEW files: a weak model continues whichever counter it
-                # saw last (design/ numbering leaked into functions/ as 01-09
-                # then 22-25, leaving 10-21 free forever). Overwriting an
-                # EXISTING path is always allowed.
-                if not os.path.exists(target):
-                    siblings = {}
-                    dpath = os.path.join(self.docs_root, directory)
-                    if os.path.isdir(dpath):
-                        for name in sorted(os.listdir(dpath)):
-                            if name.startswith(".") or not name.lower().endswith(".md"):
-                                continue
-                            m2 = _NUMBER_RE.match(name)
-                            if m2:
-                                siblings.setdefault(int(m2.group(1)), name)
-                    lowest = 1
-                    while lowest in siblings:
-                        lowest += 1
-                    if number in siblings:
-                        if siblings[number] == "%d-%s" % (number, rest):
-                            # the unpadded twin of THIS doc: the write below
-                            # replaces it under the canonical padded name
-                            unpadded_twin = os.path.join(dpath, siblings[number])
-                        else:
-                            return {"ok": False,
-                                    "error": "numbering: number %02d is already "
-                                             "taken by %s/%s - do NOT create a "
-                                             "second doc with it; update THAT "
-                                             "file instead (or merge and delete "
-                                             "the redundant one)"
-                                             % (number, directory,
-                                                siblings[number])}
-                    if number > lowest:
-                        new_rel = "%s/%02d-%s" % (directory, lowest, rest)
+            from .validate import parse_doc_path
+            parsed = parse_doc_path(rel)
+            if parsed is not None and not parsed["index"]:
+                # numbered doc: flat (functions/) or inside a module dir
+                # (functions/<module>/); numbering is per-directory
+                match = _NUMBER_RE.match(parsed["file"])
+                if match:
+                    directory = parsed["top"] if parsed["module"] is None \
+                        else "%s/%s" % (parsed["top"], parsed["module"])
+                    fname = parsed["file"]
+                    number = int(match.group(1))
+                    if number < 1:
                         return {"ok": False,
-                                "error": "numbering: %s has free numbers below "
-                                         "%02d - write this doc as '%s' instead "
-                                         "(per-directory sequential numbering)"
-                                         % (directory, number, new_rel)}
+                                "error": "numbering: doc numbers start at 01"}
+                    rest = fname[match.end():]
+                    if len(match.group(1)) < 2:
+                        orig_rel = rel
+                        rel = "%s/%02d-%s" % (directory, number, rest)
+                        unpadded_twin = target
+                        target = os.path.join(self.docs_root, *rel.split("/"))
+                        note = ("%s; numbering normalized from '%s'"
+                                % (note, orig_rel)) if note else \
+                               ("numbering normalized from '%s'" % orig_rel)
+                    # per-directory sequential numbering, enforced at write
+                    # time for NEW files: a weak model continues whichever
+                    # counter it saw last (design/ numbering leaked into
+                    # functions/ as 01-09 then 22-25, leaving 10-21 free
+                    # forever). Overwriting an EXISTING path is always allowed.
+                    if not os.path.exists(target):
+                        siblings = {}
+                        dpath = os.path.join(self.docs_root, *directory.split("/"))
+                        if os.path.isdir(dpath):
+                            for name in sorted(os.listdir(dpath)):
+                                if name.startswith(".") or not name.lower().endswith(".md"):
+                                    continue
+                                m2 = _NUMBER_RE.match(name)
+                                if m2:
+                                    siblings.setdefault(int(m2.group(1)), name)
+                        lowest = 1
+                        while lowest in siblings:
+                            lowest += 1
+                        if number in siblings:
+                            if siblings[number] == "%d-%s" % (number, rest):
+                                # the unpadded twin of THIS doc: the write below
+                                # replaces it under the canonical padded name
+                                unpadded_twin = os.path.join(dpath, siblings[number])
+                            else:
+                                return {"ok": False,
+                                        "error": "numbering: number %02d is already "
+                                                 "taken by %s/%s - do NOT create a "
+                                                 "second doc with it; update THAT "
+                                                 "file instead (or merge and delete "
+                                                 "the redundant one)"
+                                                 % (number, directory,
+                                                    siblings[number])}
+                        if number > lowest:
+                            new_rel = "%s/%02d-%s" % (directory, lowest, rest)
+                            return {"ok": False,
+                                    "error": "numbering: %s has free numbers below "
+                                             "%02d - write this doc as '%s' instead "
+                                             "(per-directory sequential numbering)"
+                                             % (directory, number, new_rel)}
         if args.get("delete") is True:
             # deleting a doc is allowed only inside functions/ or design/ and
             # only for merging duplicates/obsoletes - never the fixed files

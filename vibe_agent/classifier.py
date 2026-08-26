@@ -313,7 +313,8 @@ def main(argv=None):
     client = ChatClient(cls["base_url"], cls["api_key"], model,
                         timeout=cls["timeout"], retries=cls["retries"],
                         temperature=cls["temperature"],
-                        max_tokens=cls["max_tokens"])
+                        max_tokens=cls["max_tokens"],
+                        heartbeat_seconds=cls["heartbeat_seconds"])
 
     with open(args.shas, "r", encoding="utf-8") as fh:
         shas = [line.strip() for line in fh if line.strip()]

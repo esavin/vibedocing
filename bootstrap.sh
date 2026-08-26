@@ -89,14 +89,27 @@ render() { # <infile> <outfile>
   content="${content//@@BRANCH@@/$BRANCH}"
   content="${content//@@LANGUAGE@@/$LANGUAGE}"
   content="${content//@@LAYOUT@@/$LAYOUT}"
+  content="${content//@@MODULES@@/$MODULES}"
   content="${content//@@DATE@@/$TODAY}"
   printf '%s\n' "$content" > "$2"
 }
+
+# ---- module layout for big histories ----
+# Above a few thousand commits, a flat docs directory and a hub listing every
+# doc stop scaling (thousands of tiny files, a PROJECT.md rewritten in full on
+# every documented commit). Group docs per module instead, and consider the
+# snapshot bootstrap (--snapshot) instead of replaying the whole history.
+COMMIT_COUNT="$(git -C "$PROJECT_DIR" rev-list --count --all 2>/dev/null || echo 0)"
+MODULES="false"
+if [ "${COMMIT_COUNT:-0}" -ge 2000 ]; then
+  MODULES="true"
+fi
 
 echo ">> workspace:   $WORK_DIR"
 echo ">> project:     $PROJECT_NAME  ($PROJECT_DIR)"
 echo ">> source_root: $SOURCE_REL"
 echo ">> branch:      $BRANCH   language: $LANGUAGE ($LAYOUT)"
+echo ">> history:     $COMMIT_COUNT commit(s)   module layout: $MODULES"
 echo ">> skip regex:  $SKIP_STYLE"
 
 # ---- 1. .gitignore ----
@@ -167,14 +180,27 @@ EOF
 
 cat <<EOF
 
-=========================================================
+========================================================
  Workspace ready.
-=========================================================
+========================================================
 Next:
   ./vibedocing/run.sh --list | tail -1      # preview: how many commits to process
   ./vibedocing/run.sh --dry-run --limit 20  # classify only (no writes, no commits)
   ./vibedocing/run.sh --limit 20            # document first 20 commits (auto-committed)
   ./vibedocing/run.sh                       # continue from baseline to HEAD
+EOF
+
+if [ "$MODULES" = true ]; then
+  cat <<EOF
+
+Large history detected ($COMMIT_COUNT commits; "modules": true is set):
+  ./vibedocing/run.sh --snapshot            # document the CURRENT tree (module by
+                                             # module), then replay only NEW commits -
+                                             # hours instead of weeks for huge repos
+EOF
+fi
+
+cat <<EOF
 
 Restart after syncing new upstream changes into '$SOURCE_REL':
   ./vibedocing/run.sh                       # resumes from the committed baseline
