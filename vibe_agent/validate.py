@@ -309,9 +309,11 @@ def format_report(problems, sha=""):
 def repair_message(problems, rounds_left):
     parts = [
         "VALIDATION FAILED - your docs have mechanical problems. Fix ALL of them now "
-        "with write_doc (and search_docs to locate every occurrence), then call "
+        "with edit_doc (targeted text replacements) or write_doc (new docs only), "
+        "and search_docs to locate every occurrence, then call "
         "finish again with verdict DOC_UPDATED listing every file you modified "
-        "(across all rounds).",
+        "(across all rounds). Never rewrite a whole existing doc to fix a path - "
+        "edit_doc is the right tool and a lossy rewrite is refused.",
     ]
     if any("duplicate number" in item for item in problems["errors"]):
         parts.append(
@@ -323,9 +325,10 @@ def repair_message(problems, rounds_left):
     if any("does not exist in the repository" in item for item in problems["errors"]):
         parts.append(
             "DEAD PATHS: a file was renamed or moved by this commit (see the "
-            "grouped renames in NAME STATUS). Update each cited path to its NEW "
-            "location in the worktree, or remove the citation - never keep a "
-            "path that does not exist at this commit.")
+            "grouped renames in NAME STATUS). With edit_doc, replace each cited "
+            "old path with its NEW location in the worktree (find=old path, "
+            "replace=new path), or remove the citation if the file is gone - "
+            "never keep a path that does not exist at this commit.")
     if problems["errors"]:
         parts.append("Errors (must fix):")
         parts.extend("- %s" % item for item in problems["errors"])

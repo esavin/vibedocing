@@ -227,6 +227,42 @@ class ToolSet(object):
             {
                 "type": "function",
                 "function": {
+                    "name": "edit_doc",
+                    "description": (
+                        "Apply a TARGETED text replacement inside an existing "
+                        "doc - the right tool for path hygiene, link fixes and "
+                        "small corrections. Prefer it over rewriting a whole "
+                        "doc with write_doc: a full rewrite must reproduce "
+                        "the entire content and any silent loss is "
+                        "undetectable. `find` must occur in the doc verbatim; "
+                        "all=true replaces every occurrence (default: first "
+                        "only); an empty `replace` deletes the found text. On "
+                        "renames: find = the old path text, replace = the new "
+                        "path."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string",
+                                     "description": "existing doc, "
+                                                    "docs-root-relative"},
+                            "find": {"type": "string",
+                                     "description": "exact text to find "
+                                                    "(verbatim)"},
+                            "replace": {"type": "string",
+                                        "description": "replacement text "
+                                                       "(empty deletes)"},
+                            "all": {"type": "boolean",
+                                    "description": "replace every occurrence "
+                                                   "(default: first only)"},
+                        },
+                        "required": ["path", "find"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "finish",
                     "description": (
                         "End this step. The ONLY way to finish. verdict: DOC_UPDATED if you "
@@ -261,6 +297,7 @@ class ToolSet(object):
             "list_dir": self._tool_list_dir,
             "search_docs": self._tool_search_docs,
             "write_doc": self._tool_write_doc,
+            "edit_doc": self._tool_edit_doc,
         }.get(name)
         if handler is None:
             return {"ok": False, "error": "unknown tool: %s" % name}
@@ -623,6 +660,25 @@ class ToolSet(object):
                     "error": "append: '%s' does not exist yet - write it first "
                              "without append, then append the following parts"
                              % rel}
+        if not append and os.path.isfile(target):
+            # shrink guard: a whole-doc rewrite that loses most of the content
+            # is almost always the model reconstructing a doc from compacted
+            # context (fernflower 842af198: full design docs became path-list
+            # stubs). Targeted changes must go through edit_doc instead.
+            try:
+                with open(target, "r", encoding="utf-8", errors="replace") as fh:
+                    old = fh.read()
+            except OSError:
+                old = ""
+            if old and len(old) >= 2000 and len(content) < len(old) * 0.5:
+                return {"ok": False,
+                        "error": "refused: this rewrite would shrink '%s' from "
+                                 "%d to %d chars - whole-doc rewrites must not "
+                                 "lose content (a validator CANNOT detect the "
+                                 "loss). Use edit_doc for targeted changes, or "
+                                 "read_file the doc and rewrite it faithfully "
+                                 "(split across write_doc + append calls)"
+                                 % (rel, len(old), len(content))}
         parent = os.path.dirname(target)
         if parent != self.docs_root and not parent.startswith(self.docs_root + os.sep):
             return {"ok": False, "error": "refused: parent escapes the docs root"}
@@ -671,6 +727,92 @@ class ToolSet(object):
                 "cited path(s) not found in the worktree at this commit "
                 "(fix or remove BEFORE finishing - they WILL fail validation): %s"
                 % ", ".join(missing))
+        return result
+
+    def _tool_edit_doc(self, args):
+        """Targeted in-place text replacement in an existing doc (path
+        hygiene, link fixes) - see the shrink guard in _tool_write_doc for
+        why whole-doc rewrites are the wrong default for these."""
+        if self.classify_only:
+            return {"ok": False,
+                    "error": "classify-only mode: writes are disabled; call "
+                             "finish with the verdict you would have produced"}
+        raw = args.get("path")
+        if not isinstance(raw, str) or not raw.strip():
+            return {"ok": False, "error": "path must be a non-empty string"}
+        find = args.get("find")
+        if not isinstance(find, str) or not find:
+            return {"ok": False, "error": "find must be a non-empty string"}
+        replace = args.get("replace")
+        if not isinstance(replace, str):
+            replace = ""
+        raw = raw.strip()
+        target = None
+        for candidate in (raw, self._strip_docs_prefix(raw)):
+            if not isinstance(candidate, str) or not candidate:
+                continue
+            path = (os.path.realpath(candidate) if os.path.isabs(candidate)
+                    else os.path.realpath(os.path.join(self.docs_root,
+                                                       candidate)))
+            if not path.lower().endswith(".md"):
+                continue
+            if path != self.docs_root and not path.startswith(
+                    self.docs_root + os.sep):
+                continue
+            if os.path.isfile(path):
+                target = path
+                break
+        if target is None:
+            return {"ok": False,
+                    "error": "edit_doc: doc not found under the docs root: "
+                             "'%s' (read_file it first; check the exact path "
+                             "with search_docs)" % raw}
+        rel = os.path.relpath(target, self.docs_root).replace(os.sep, "/")
+        try:
+            with open(target, "r", encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+        except OSError as exc:
+            return {"ok": False, "error": "cannot read '%s': %s" % (rel, exc)}
+        if find not in text:
+            return {"ok": False,
+                    "error": "find text not present in '%s' - re-read the doc "
+                             "and copy the text EXACTLY (it may already be "
+                             "fixed)" % rel}
+        occurrences = text.count(find)
+        if args.get("all") is True:
+            new_text = text.replace(find, replace)
+            done = occurrences
+        else:
+            new_text = text.replace(find, replace, 1)
+            done = 1
+        try:
+            with open(target, "w", encoding="utf-8") as fh:
+                fh.write(new_text)
+        except OSError as exc:
+            return {"ok": False, "error": "cannot write '%s': %s" % (rel, exc)}
+        self.wrote_docs = True
+        if rel not in self.written_files:
+            self.written_files.append(rel)
+        result = {"ok": True, "path": rel, "replacements": done}
+        if occurrences > done:
+            result["note"] = ("%d more occurrence(s) of the same text remain "
+                              "in '%s' - repeat the call (all=true replaces "
+                              "them all at once)"
+                              % (occurrences - done, rel))
+        # same write-time path lint as write_doc, applied to the replacement
+        missing = []
+        seen = set()
+        for line in replace.splitlines():
+            for token in _path_candidates(line):
+                if token in seen:
+                    continue
+                seen.add(token)
+                if not os.path.exists(os.path.join(self.worktree, token)):
+                    missing.append(token)
+        if missing:
+            result["warning"] = (
+                "replacement cites path(s) not found in the worktree at this "
+                "commit (they WILL fail validation): %s" % ", ".join(missing))
         return result
 
     def _tool_finish(self, args):

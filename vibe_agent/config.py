@@ -47,6 +47,11 @@ LIMIT_DEFAULTS = {
     "compact_threshold_tokens": 0,
     "compact_keep_groups": 4,
     "compact_result_chars": 2_000,
+    # path-hygiene batching (hygiene.py): docs per repair session; a worklist
+    # bigger than this is split into fresh sessions so combined write_doc
+    # payloads never exceed the context window. 0 = single session (old
+    # behavior). The deterministic rename pre-pass itself is always on.
+    "hygiene_batch_docs": 5,
 }
 
 # Preset for ~32k-context models (self-hosted/desktop gateways): tight caps

@@ -636,7 +636,7 @@ token_sum() { # <verdicts-glob> -> "prompt completion total"
 }
 read -r AP AC AT <<< "$(token_sum "$VERDICTS"/*.json)"
 echo "tokens agent: prompt=$AP completion=$AC total=$AT"
-if [ -d "$CLS_VERDICTS" ]; then
+if [ -d "${CLS_VERDICTS:-}" ]; then
   read -r CP CC CT <<< "$(token_sum "$CLS_VERDICTS"/*.json)"
   echo "tokens classifier: prompt=$CP completion=$CC total=$CT"
   echo "tokens combined total: $((AT + CT))"

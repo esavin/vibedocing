@@ -23,6 +23,7 @@ import sys
 
 from .agent import run_agent
 from .config import ConfigError, load_config, resolve_llm, resolve_limits
+from .hygiene import hygiene_plan
 from .llm import ChatClient, FatalLLMError
 from .prompt import (InspectError, SYSTEM_PROMPT, build_first_user,
                      build_reconsider_message, load_prior_hint, sha_looks_valid)
@@ -173,7 +174,21 @@ def main(argv=None):
     old_paths = []
     root_commit = False
     changed = 0
+    plan = None
     try:
+        # deterministic path hygiene FIRST (mode=document only): citations of
+        # RENAMED paths are rewritten in place before any LLM call, and a
+        # remaining repair worklist bigger than hygiene_batch_docs docs is
+        # split into per-batch sessions (hygiene.py)
+        if not args.classify_only:
+            plan = hygiene_plan(worktree, args.sha, docs_root,
+                                batch_docs=int(limits.get("hygiene_batch_docs")
+                                               or 5))
+            if plan["prepass_edited"]:
+                log("rename pre-pass: %d citation(s) rewritten across %d doc(s)"
+                    " (deterministic, no LLM)"
+                    % (sum(plan["prepass_edited"].values()),
+                       len(plan["prepass_edited"])))
         first_user, info = build_first_user(args.sha, worktree, docs_root, mode,
                                             today, read_conventions(docs_root),
                                             limits=limits)
@@ -208,9 +223,21 @@ def main(argv=None):
             log("prior-run hint loaded: %d doc(s) eligible for reconsideration"
                 % len(prior_hint["docs"]))
 
-    def validator():
-        """Called by the agent loop after a DOC_UPDATED finish (repair rounds)."""
+    def validator(scope_docs=None):
+        """Called by the agent loop after a DOC_UPDATED finish (repair rounds).
+
+        With scope_docs (a path-hygiene batch session) only that batch's docs
+        are checked and fed back: other batches' stale paths belong to their
+        own sessions and would be pure repair noise here."""
         problems = validate_docs(docs_root, worktree, old_paths, path_check)
+        if scope_docs is not None:
+            scope = set(scope_docs)
+            problems = {
+                "errors": [e for e in problems["errors"]
+                           if e.split(":", 1)[0].strip() in scope],
+                "warnings": [w for w in problems["warnings"]
+                             if w.split(":", 1)[0].strip() in scope],
+            }
         report_path = os.path.join(args.verdicts_dir,
                                    args.sha + ".validation.md")
         try:
@@ -228,22 +255,35 @@ def main(argv=None):
     if verdict is None:
         max_steps = llm["max_steps"]
         boost = 0
+        batches = (plan or {}).get("batches") or []
+        stale_by_doc = (plan or {}).get("stale_by_doc") or {}
         if root_commit and llm["max_steps_initial"] > 0:
             max_steps = llm["max_steps_initial"]
-        elif changed:
+        elif changed and not batches and not (
+                plan and (plan["prepass_edited"] or plan["stale_by_doc"])):
             # doc-heavy commits (big moves touching many cited docs) need more
-            # tool rounds: +1 step per 8 changed files, capped at max_steps_cap
+            # tool rounds: +1 step per 8 changed files, capped at max_steps_cap.
+            # NOT applied when path hygiene ran (pre-pass or a batched
+            # worklist): the repair workload is handled by its own mechanical
+            # pass / batch sessions, and a giant changed-file count then only
+            # buys the classification session room to wander.
             boost = min(max(0, llm["max_steps_cap"] - max_steps), changed // 8)
             max_steps += boost
         limits_label = limits["profile"]
         if limits["compact_threshold_tokens"]:
             limits_label += " (compact >= %d tokens)" % limits["compact_threshold_tokens"]
+        if batches:
+            limits_label += (" hygiene=%d doc(s) in %d batch(es)"
+                             % (len(stale_by_doc), len(batches)))
         log("model=%s endpoint=%s mode=%s root_commit=%s steps<=%d%s validation=%s/%d limits=%s"
             % (llm["model"], llm["base_url"], mode, root_commit, max_steps,
                (" (+%d for %d changed files)" % (boost, changed)) if boost else "",
                val_mode, val_rounds, limits_label))
-        if transcript is not None:
-            transcript.record({
+
+        def record_session(extra=None):
+            if transcript is None:
+                return
+            record = {
                 "type": "session",
                 "sha": args.sha,
                 "model": llm["model"],
@@ -256,18 +296,61 @@ def main(argv=None):
                 "compact_threshold_tokens": limits["compact_threshold_tokens"],
                 "system_prompt_chars": len(SYSTEM_PROMPT),
                 "first_user_chars": len(first_user),
-            })
+            }
+            if extra:
+                record.update(extra)
+            transcript.record(record)
+
+        record_session()
+        session_verdicts = []
+        wrote_docs = False
         try:
+            # path-hygiene batches: one fresh, small session per batch of the
+            # repair worklist (giant single sessions blow the context window)
+            for index, batch in enumerate(batches):
+                batch_docs = tuple(sorted(batch))
+                focus_user, _info = build_first_user(
+                    args.sha, worktree, docs_root, mode, today,
+                    read_conventions(docs_root), limits=limits,
+                    focus={"batch": index + 1, "batches": len(batches),
+                           "stale": batch})
+                batch_tools = ToolSet(worktree, docs_root,
+                                      classify_only=args.classify_only,
+                                      limits=limits)
+                record_session({"batch": "%d/%d" % (index + 1, len(batches)),
+                                "focus_docs": list(batch_docs),
+                                "first_user_chars": len(focus_user),
+                                "max_steps": llm["max_steps"]})
+                log("hygiene batch %d/%d: %s" % (index + 1, len(batches),
+                                                 ", ".join(batch_docs)))
+                session_verdicts.append(run_agent(
+                    client, batch_tools, SYSTEM_PROMPT, focus_user,
+                    llm["max_steps"], log,
+                    validator=lambda docs=batch_docs: validator(docs),
+                    repair_rounds=val_rounds, transcript=transcript,
+                    limits=limits))
+                wrote_docs = wrote_docs or batch_tools.wrote_docs
+
+            # main session: classification as usual. After batches the docs
+            # changed, so the first message is rebuilt (its stale-docs
+            # worklist must reflect the post-repair state, not the old one).
+            if batches:
+                first_user, _info = build_first_user(
+                    args.sha, worktree, docs_root, mode, today,
+                    read_conventions(docs_root), limits=limits)
             verdict = run_agent(client, tools, SYSTEM_PROMPT, first_user,
                                 max_steps, log,
                                 validator=validator, repair_rounds=val_rounds,
                                 transcript=transcript, reconsider=reconsider,
                                 limits=limits)
+            session_verdicts.append(verdict)
+            wrote_docs = wrote_docs or tools.wrote_docs
         except FatalLLMError as exc:
             verdict = {"verdict": "ERROR", "files": [], "reason":
                        "llm: %s" % exc, "steps": 0,
                        "usage": {"prompt_tokens": 0, "completion_tokens": 0,
                                  "total_tokens": 0}}
+            session_verdicts.append(verdict)
             if transcript is not None:
                 transcript.record({"type": "end", "verdict": "ERROR",
                                    "reason": verdict["reason"]})
@@ -275,8 +358,52 @@ def main(argv=None):
             if transcript is not None:
                 transcript.close()
 
-        # final validation state (the validator callback tracks the last run)
-        if val_mode != "off" and not args.classify_only and tools.wrote_docs:
+        # aggregate the pre-pass + every session into ONE commit verdict
+        prepass_edited = (plan or {}).get("prepass_edited") or {}
+        files = list(prepass_edited)
+        for session in session_verdicts:
+            for item in session.get("files") or []:
+                if item and item not in files:
+                    files.append(item)
+        usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        steps = 0
+        for session in session_verdicts:
+            for key in usage:
+                usage[key] += int((session.get("usage") or {}).get(key) or 0)
+            steps += int(session.get("steps") or 0)
+        failed = [s for s in session_verdicts if s["verdict"] == "ERROR"]
+        verdict = {
+            "verdict": session_verdicts[-1]["verdict"] if session_verdicts
+                       else "ERROR",
+            "files": files,
+            "reason": (session_verdicts[-1].get("reason") or "")
+                      if session_verdicts else "no session ran",
+            "steps": steps,
+            "usage": usage,
+        }
+        if failed:
+            verdict["verdict"] = "ERROR"
+            verdict["files"] = []
+            verdict["reason"] = failed[0].get("reason") or "session failed"
+        elif files and verdict["verdict"] == "NO_DOC":
+            # docs changed this invocation (pre-pass / batches) - never report
+            # NO_DOC with dirty docs on disk
+            verdict["verdict"] = "DOC_UPDATED"
+        if len(session_verdicts) > 1 or prepass_edited:
+            note = ("path hygiene: %d deterministic rewrite(s) in %d doc(s), "
+                    "%d agent session(s)"
+                    % (sum(prepass_edited.values()), len(prepass_edited),
+                       len(session_verdicts)))
+            if verdict["reason"]:
+                verdict["reason"] = note + "; " + verdict["reason"]
+            else:
+                verdict["reason"] = note
+
+        # final validation state (the validator callback tracks the last run);
+        # gated on ANY docs change this invocation - agent sessions, the
+        # deterministic rename pre-pass, or both
+        if (val_mode != "off" and not args.classify_only
+                and (wrote_docs or prepass_edited)):
             problems = validate_docs(docs_root, worktree, old_paths, path_check)
             last_validation = {"errors": len(problems["errors"]),
                                "warnings": len(problems["warnings"]),

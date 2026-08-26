@@ -68,7 +68,8 @@ validator checks what you wrote (doc-internal links, unique doc numbering, fixed
 layout, that cited repo paths exist in the worktree, that no doc still cites a \
 path renamed/deleted by this commit, and that PROJECT.md keeps BOTH navigation \
 sections). If it reports problems you will get one repair \
-round: fix ONLY the listed problems with write_doc, then IMMEDIATELY call finish \
+round: fix ONLY the listed problems with edit_doc (targeted replacements - \
+never rewrite whole docs for a path fix), then IMMEDIATELY call finish \
 again - do not re-read files, re-verify, or explore anything else first. Also: \
 read_file/list_dir paths are absolute or relative to the WORKTREE or DOCS ROOT \
 themselves - never prefix them with a workspace folder like agent/project/. Repeated \
@@ -95,7 +96,10 @@ always obvious from the diff.
 When NAME STATUS shows renames or deletions of files that docs cite:
 1. Use the search_docs tool to find EVERY doc mentioning the old path (the precomputed \
 STALE DOC REFERENCES list is a starting point, not a guarantee of completeness).
-2. Replace old paths with the new ones (for R), keeping descriptions otherwise intact.
+2. Replace old paths with the new ones (for R) with edit_doc - find the old path \
+text, replace with the new path - keeping the rest of each doc intact. A whole-doc \
+rewrite (write_doc) for a path change is WRONG: it risks losing content and is \
+refused by the shrink guard when it drops half the doc.
 3. For deletions (D): remove or rewrite the reference - never leave a citation of a \
 file that no longer exists at this commit.
 4. Also fix any OTHER broken relative links or stale paths you notice in the files you \
@@ -503,11 +507,43 @@ def docs_overview(docs_root, max_chars=6000, max_entries=80):
     return text
 
 
+def focus_section(focus):
+    """The scoped worklist of a path-hygiene batch session (cli splits a
+    giant repair worklist into several fresh sessions; this section replaces
+    the generic stale-docs section and pins the session to its batch)."""
+    lines = [
+        "SESSION SCOPE - PATH HYGIENE (batch %d of %d; sibling sessions repair "
+        "the other affected docs - do NOT read or write any doc outside this "
+        "list, do not touch PROJECT.md, do not create or renumber docs):"
+        % (focus.get("batch", 1), focus.get("batches", 1)),
+    ]
+    for doc, olds in sorted(focus.get("stale", {}).items()):
+        lines.append("- %s cites old paths (renamed/deleted by THIS commit):"
+                     % doc)
+        lines.extend("    %s" % old for old in olds)
+    lines.append(
+        "For every cited old path: NAME STATUS above shows where this commit "
+        "moved it (R entries / grouped directory moves). With edit_doc replace "
+        "each cited old path with its new path when it exists in the worktree "
+        "(verify with list_dir/read_file), else remove or rephrase the "
+        "reference - the old path no longer exists at this commit. Never "
+        "rewrite a whole doc for a path fix. Then call finish with verdict "
+        "DOC_UPDATED listing exactly the docs you modified (or NO_DOC if a "
+        "listed doc needed no change after all)."
+    )
+    return "\n".join(lines)
+
+
 def build_first_user(sha, worktree, docs_root, mode, today, conventions,
-                     limits=None):
+                     limits=None, focus=None):
     """Build the first user message. Returns (text, info) where info carries
     {"is_root": bool, "old_paths": [...], "changed": int} for the caller
-    (validation old-paths and adaptive step budgeting)."""
+    (validation old-paths and adaptive step budgeting).
+
+    `focus` (path-hygiene batch mode): {"batch": k, "batches": n, "stale":
+    {doc: [old paths]}} - the session is pinned to repairing exactly these
+    docs; the diff injection, docs numbering and the docs-map overview are
+    skipped (not needed for repair), keeping the session context minimal."""
     lim = limits if isinstance(limits, dict) else {}
     subject = _git(worktree, ["log", "-1", "--format=%s", sha]).strip()
     message = _git(worktree, ["log", "-1", "--format=%B", sha]).strip()
@@ -546,9 +582,10 @@ def build_first_user(sha, worktree, docs_root, mode, today, conventions,
         # FULL DIFF: when the complete change fits the cap, inject it so the
         # agent can classify without a git-show round-trip (most SKIP verdicts
         # become a single request). Injected only whole - a truncated diff
-        # would look complete but is not. 0 disables.
+        # would look complete but is not. 0 disables. Skipped in focus mode
+        # (path-hygiene repair needs the moves, not the diff).
         diff_cap = int(lim.get("diff_chars") or 0)
-        if diff_cap > 0 and parent:
+        if diff_cap > 0 and parent and focus is None:
             diff = _git_ok(worktree, ["diff", "-M", parent, sha]).strip("\n")
             if diff and len(diff) <= diff_cap:
                 sections.append(
@@ -557,7 +594,9 @@ def build_first_user(sha, worktree, docs_root, mode, today, conventions,
                     "re-fetch with git show):\n%s" % diff
                 )
 
-    if old_paths:
+    if focus is not None:
+        sections.append(focus_section(focus))
+    elif old_paths:
         stale = stale_doc_references(docs_root, old_paths)
         if stale:
             sections.append(
@@ -566,23 +605,24 @@ def build_first_user(sha, worktree, docs_root, mode, today, conventions,
                 "for each old path):\n%s" % stale
             )
 
-    numbering = docs_numbering(docs_root)
-    if numbering:
-        sections.append(
-            "DOCS NUMBERING (exact current state - use these numbers, do not "
-            "compute your own):\n%s" % numbering
-        )
+    if focus is None:
+        numbering = docs_numbering(docs_root)
+        if numbering:
+            sections.append(
+                "DOCS NUMBERING (exact current state - use these numbers, do not "
+                "compute your own):\n%s" % numbering
+            )
 
-    overview = docs_overview(docs_root,
-                             int(lim.get("docs_overview_chars") or 6000))
-    if overview:
-        sections.append(
-            "DOCS MAP OVERVIEW (every existing doc with its title - functions/ "
-            "docs describe user-facing capabilities, design/ docs the technical "
-            "how; decide NEW vs UPDATE from this list; read a specific doc ONLY "
-            "if you will edit it, and never create a second doc for a topic "
-            "already listed here):\n%s" % overview
-        )
+        overview = docs_overview(docs_root,
+                                 int(lim.get("docs_overview_chars") or 6000))
+        if overview:
+            sections.append(
+                "DOCS MAP OVERVIEW (every existing doc with its title - functions/ "
+                "docs describe user-facing capabilities, design/ docs the technical "
+                "how; decide NEW vs UPDATE from this list; read a specific doc ONLY "
+                "if you will edit it, and never create a second doc for a topic "
+                "already listed here):\n%s" % overview
+            )
 
     if not conventions:
         conventions = ("(missing - infer conservatively from the source tree and flag "
