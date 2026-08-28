@@ -36,7 +36,8 @@ PROJECT_NAME="$(basename "$PROJECT_DIR")"
 
 # is the project inside the workspace? -> gitignore its relative path; else absolute source_root
 if [[ "$PROJECT_DIR" == "$WORK_DIR"/* ]]; then
-  PROJECT_REL="$(realpath --relative-to="$WORK_DIR" "$PROJECT_DIR")"
+  # strip the workspace prefix (GNU realpath --relative-to is unavailable on macOS/BSD)
+  PROJECT_REL="${PROJECT_DIR#"$WORK_DIR"/}"
   SOURCE_REL="$PROJECT_REL"
 else
   PROJECT_REL=""
