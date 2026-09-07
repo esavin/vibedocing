@@ -59,6 +59,14 @@ one repeated `git show`); the last 5 steps carry deadline pressure and a hard
 (up to 2×6 steps); a budget that runs out with docs already written gets ONE
 finish-only grace round - and if even that passes without a finish call, the
 verdict is synthesized from the docs actually written (still validated).
+Text-only replies (narration, or tool calls the gateway left as plain text)
+are nudged back to tools but never forever: 5 in a row aborts with an ERROR,
+and a text-only reply at an exhausted budget falls through to the same
+grace/synthesis/max-steps handling as tool-bearing steps. DeepSeek models that
+emit tool calls as DSML text in `content` (`<｜DSML｜:finish verdict="…"/>`
+attribute form and the JSON-body form) get them lifted into the real
+tool-call channel automatically, so a gateway whose chat template drops them
+still works.
 `write_doc` supports `{"append": true}` for docs too long for one call, and a
 tool call whose JSON was cut off by the gateway's output token limit (qwen on
 neuraldeep caps at 8000 tokens without setting `finish_reason`) gets a
@@ -381,12 +389,21 @@ PYTHONPATH=vibedocing python3 -m vibe_agent --config vibedocing/config.json \
     weak for tool loops; switch model (see the Qwen/gpt-oss notes above). The
     pipeline already compensates for the most common weak-model traits: docs-root
     prefixes on read paths are auto-stripped, repair rounds extend the step
-    budget, text-only/empty replies get an immediate user nudge back to tools,
+    budget, text-only/empty replies get an immediate user nudge back to tools
+    (bounded: 5 text-only or 3 empty replies in a row → ERROR; a text-only
+    reply at an exhausted budget ends the session instead of nudging past it),
     exact duplicate calls are refused, the deadline is pushed hard in the last
     5 steps, and a budget that runs out mid-write is extended (up to 2×6 steps)
     with a final finish-only grace round when docs were written.
   Note: a genuinely *exceeded* context window surfaces differently — as
   `ERROR llm: HTTP 400 … context length …`, not as max_steps.
+- **`ERROR model returned N text-only responses in a row`** — the model kept
+  replying with plain text and no tool calls despite nudging. Most often the
+  model emits tool calls *as text*: DeepSeek's DSML-in-content
+  (`<｜DSML｜:finish verdict="…"/>`) is auto-lifted into the tool-call channel,
+  but other in-content dialects are not. Inspect the transcript
+  (`python3 -m vibe_agent.transcript …`) for call-shaped text; if it persists,
+  switch model or endpoint.
 - **worktree add failed** — stale worktree registrations are pruned automatically
   before every add, and the die message now includes git's stderr; if it still
   happens, inspect `git -C <source> worktree list` / run `git -C <source>

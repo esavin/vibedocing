@@ -34,6 +34,157 @@ _OVERFLOW_PAIRS = (
 _LIMIT_RE = re.compile(
     r"(?:пределе|limit|length|maximum|max)[^\d]{0,30}(\d{4,})", re.IGNORECASE)
 
+# DeepSeek models sometimes emit tool calls as plain text in content - the
+# DSML syntax (<｜DSML｜:finish verdict="..." .../> or
+# <｜DSML｜:finish>{json}</｜DSML｜:finish>) - instead of the message.tool_calls
+# channel (the gateway's chat template fails to lift them). Left unparsed,
+# every such reply looks "text-only" and the agent nudges the model back to
+# tools forever: the model believes it IS calling tools, so it repeats the
+# same DSML text (observed: snapshot resources module, 77+ identical rounds).
+_DSML_PREFIX = "<｜DSML｜:"
+_DSML_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# key="quoted value" (backslash escapes allowed) or key=[unquoted json array]
+_DSML_ATTR_RE = re.compile(
+    r'([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:"((?:[^"\\]|\\.)*)"|(\[[^\]]*\]))')
+_DSML_MAX_CALLS = 16
+_DSML_SEGMENT_CHARS = 20_000  # attr-form span cap (garbled multi-call blobs)
+
+
+def _balanced_json_end(text, start):
+    """Index just past the balanced {...} object opening at text[start]
+    (string- and escape-aware), or 0 when it never closes."""
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+    return 0
+
+
+def _dsml_calls(text):
+    """Scan content for DSML tool calls. [{name, arguments, span: (s, e)}].
+
+    Well-formed calls only, at most _DSML_MAX_CALLS; [] when the text carries
+    none. Attribute values keep their JSON type when they parse ("..."-quoted
+    scalars, arrays); repeated attributes become a list; a STRING "files"
+    value is normalized to a path list because the finish tool schema wants
+    an array and models emit both files="a b" and files="a, b".
+    """
+    if not isinstance(text, str) or _DSML_PREFIX not in text:
+        return []
+    found = []
+    pos = text.find(_DSML_PREFIX)
+    while pos >= 0 and len(found) < _DSML_MAX_CALLS:
+        name_match = _DSML_NAME_RE.match(text, pos + len(_DSML_PREFIX))
+        if not name_match:
+            pos = text.find(_DSML_PREFIX, pos + 1)
+            continue
+        name = name_match.group(0)
+        i = name_match.end()
+        while i < len(text) and text[i] in " \t\r\n":
+            i += 1
+        # HTML-ish opener: <｜DSML｜:finish>{json}</｜DSML｜:finish>
+        opened = text.startswith(">", i)
+        if opened:
+            i += 1
+            while i < len(text) and text[i] in " \t\r\n":
+                i += 1
+        arguments = None
+        end = 0
+        if text.startswith("{", i):
+            close = _balanced_json_end(text, i)
+            if close:
+                try:
+                    parsed = json.loads(text[i:close])
+                except ValueError:
+                    parsed = None
+                if isinstance(parsed, dict):
+                    arguments = parsed
+                    tag = "</%s%s>" % (_DSML_PREFIX, name)
+                    end = close + (len(tag) if text.startswith(tag, close) else 0)
+        if arguments is None:
+            # attribute form: scan to the first '>' outside double quotes
+            j = i
+            in_str = False
+            esc = False
+            while j < len(text):
+                ch = text[j]
+                if in_str:
+                    if esc:
+                        esc = False
+                    elif ch == "\\":
+                        esc = True
+                    elif ch == '"':
+                        in_str = False
+                elif ch == '"':
+                    in_str = True
+                elif ch == ">":
+                    break
+                j += 1
+            if j >= len(text):
+                if not opened:
+                    pos = text.find(_DSML_PREFIX, pos + 1)
+                    continue
+                # a bare <｜DSML｜:name> opener with nothing else: an empty
+                # call the tool layer answers with a schema error (better
+                # feedback to the model than dropping it silently)
+                arguments, end = {}, i
+            elif j - i > _DSML_SEGMENT_CHARS:
+                pos = text.find(_DSML_PREFIX, pos + 1)
+                continue
+            else:
+                arguments = {}
+                for match in _DSML_ATTR_RE.finditer(text[i:j]):
+                    key = match.group(1)
+                    raw = match.group(2)
+                    if raw is None:  # unquoted [...] value
+                        raw = match.group(3)
+                    try:
+                        value = json.loads(raw)
+                    except ValueError:
+                        value = raw
+                    if key in arguments:
+                        previous = arguments[key]
+                        if not isinstance(previous, list):
+                            arguments[key] = [previous]
+                        arguments[key].append(value)
+                    else:
+                        arguments[key] = value
+                end = j + 1
+        files = arguments.get("files")
+        if isinstance(files, str):
+            # "a b", "a, b" and even an unparsable "[a, b]" all normalize to
+            # the path list the finish schema expects
+            arguments["files"] = [p for p in re.split(r"[,\s]+",
+                                                      files.strip("[]")) if p]
+        found.append({"name": name, "arguments": arguments, "span": (pos, end)})
+        pos = text.find(_DSML_PREFIX, end) if end > pos else pos + 1
+    return found
+
+
+def parse_dsml_tool_calls(text):
+    """DSML tool calls lifted into the flat internal tool-call shape
+    [{id, type, name, arguments}] (arguments re-serialized as JSON)."""
+    return [{"id": "call_dsml_%d" % n, "type": "function",
+             "name": call["name"],
+             "arguments": json.dumps(call["arguments"], ensure_ascii=False)}
+            for n, call in enumerate(_dsml_calls(text))]
+
 
 class FatalLLMError(Exception):
     """Endpoint error that retries cannot fix (or retries exhausted)."""
@@ -249,6 +400,27 @@ class ChatClient(object):
                 "name": function.get("name") or "",
                 "arguments": function.get("arguments") or "{}",
             })
+        if not tool_calls:
+            lifted = _dsml_calls(content)
+            if lifted:
+                # DSML-in-content fallback: lift the calls so the agent loop
+                # sees real tool calls, and strip their spans from the echoed
+                # content so the resent history keeps only the narration text
+                # (the calls themselves travel via clean["tool_calls"]).
+                _log("%d DSML tool call(s) lifted from content into tool_calls"
+                     % len(lifted))
+                stripped = content
+                for call in reversed(lifted):
+                    start, end = call["span"]
+                    stripped = stripped[:start] + stripped[end:]
+                clean["content"] = stripped.strip()
+                tool_calls = [
+                    {"id": "call_dsml_%d" % n, "type": "function",
+                     "name": call["name"],
+                     "arguments": json.dumps(call["arguments"],
+                                             ensure_ascii=False)}
+                    for n, call in enumerate(lifted)
+                ]
         if tool_calls:
             # OpenAI-compatible serialization for the NEXT request: strict
             # gateways (e.g. api.ai.gnivc.ru, Rust/Serde) reject the flattened

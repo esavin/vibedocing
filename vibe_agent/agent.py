@@ -10,9 +10,12 @@ needs to fix and re-finish.
 
 Weak-model guardrails observed on real runs (fernflower):
 - narration/empty responses: a reply with text but no tool call gets a short
-  user nudge pushing the model back to tools; an EMPTY reply (all tokens burned
-  as hidden reasoning) is nudged too, and only aborted after
-  `EMPTY_ABORT_THRESHOLD` consecutive empties;
+  user nudge pushing the model back to tools, ABORTED after
+  `TEXT_ABORT_THRESHOLD` consecutive text-only replies (and a text-only reply
+  at an exhausted budget falls through to the shared budget handling - grace
+  round, synthesized finish or max-steps error - instead of nudging forever);
+  an EMPTY reply (all tokens burned as hidden reasoning) is nudged too, and
+  only aborted after `EMPTY_ABORT_THRESHOLD` consecutive empties;
 - duplicate calls: an EXACT repeat of a previous (tool, arguments) pair is
   refused with an explanation instead of executing (real runs burned 5-7 steps
   re-reading the same file or re-running the same `git show --stat`);
@@ -68,6 +71,10 @@ WRITE_EXTENSIONS = 2
 RECONSIDER_EXTRA_STEPS = 8  # budget for the one-shot prior-docs reconsideration
 DEADLINE_WINDOW = 5  # last N steps of the budget get deadline pressure
 EMPTY_ABORT_THRESHOLD = 3
+# text-only replies (narration, or tool calls the gateway left as DSML text)
+# get nudged back to tools, but never forever - llm.py lifts DSML calls, and
+# whatever still arrives as text errors out after this many consecutive rounds
+TEXT_ABORT_THRESHOLD = 5
 # escalating emergency passes after a provider context-limit 400 (see
 # _overflow_shrink); each must free chars or the session errors out
 OVERFLOW_ATTEMPTS = 4
@@ -249,6 +256,7 @@ def run_agent(client, tools, system_prompt, first_user, max_steps, log,
     ]
     usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     empty_streak = 0
+    text_streak = 0
     repairs_used = 0
     budget = max_steps
     step = 0
@@ -275,7 +283,7 @@ def run_agent(client, tools, system_prompt, first_user, max_steps, log,
     def one_round():
         """A single model round-trip + tool execution. True = stop the loop."""
         nonlocal budget, write_extensions, deadline_sent_at, finish_only
-        nonlocal grace_used, step, empty_streak, repairs_used
+        nonlocal grace_used, step, empty_streak, text_streak, repairs_used
         nonlocal reconsider_used, last_prompt_tokens, compact_stalled
         nonlocal compact_threshold
         step += 1
@@ -360,12 +368,24 @@ def run_agent(client, tools, system_prompt, first_user, max_steps, log,
             # (a grace round with docs on disk falls through to the
             # synthesized finish below instead of nudging further)
             text = (response.get("content") or "").strip()
-            if text:
+            if text and step < budget:
+                # narration without a tool call: nudge back to tools, but
+                # never forever - abort after TEXT_ABORT_THRESHOLD rounds
                 empty_streak = 0
+                text_streak += 1
+                if text_streak >= TEXT_ABORT_THRESHOLD:
+                    record({"type": "end", "verdict": "ERROR",
+                            "reason": "model returned %d text-only responses "
+                                      "in a row" % text_streak, "step": step})
+                    one_round.result = _error(
+                        "model returned %d text-only responses in a row"
+                        % text_streak, usage, step)
+                    return True
                 user_message(NUDGE_TEXTONLY, "nudge:text-only")
-                log("step %d/%d text-only reply - nudged back to tools"
-                    % (step, budget))
-            else:
+                log("step %d/%d text-only reply (%d/%d) - nudged back to tools"
+                    % (step, budget, text_streak, TEXT_ABORT_THRESHOLD))
+                return False
+            if not text:
                 empty_streak += 1
                 if empty_streak >= EMPTY_ABORT_THRESHOLD:
                     record({"type": "end", "verdict": "ERROR",
@@ -378,9 +398,14 @@ def run_agent(client, tools, system_prompt, first_user, max_steps, log,
                 user_message(NUDGE_EMPTY, "nudge:empty")
                 log("step %d/%d empty reply (%d/%d) - nudged"
                     % (step, budget, empty_streak, EMPTY_ABORT_THRESHOLD))
-            return False
+                return False
+            # a text-only reply at/after the step budget falls through to the
+            # shared exhaustion handling below (grace round / synthesized
+            # finish / max-steps error) instead of nudging past the budget
+            # forever
 
         empty_streak = 0
+        text_streak = 0
         finish_report = None
         finished = False
         wrote_this_step = False

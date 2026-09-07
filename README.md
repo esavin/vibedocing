@@ -79,9 +79,13 @@ mywork/                         <- workspace (its own git repo)
    `prompt_tokens` crosses a threshold, keeping mid-session requests inside
    the window. If the provider still rejects a request as too big (HTTP
    400 context-limit), the agent runs escalating emergency compaction
-   (including oversized injected messages such as validator feedback),
-   retries in place, and lowers its compaction threshold to the
-   provider-reported window for the rest of the session.
+    (including oversized injected messages such as validator feedback),
+    retries in place, and lowers its compaction threshold to the
+    provider-reported window for the rest of the session. Protocol drift from
+    weak gateways is contained too: tool calls emitted as plain text in
+    `content` (DeepSeek's DSML syntax) are lifted back into the tool-call
+    channel, and text-only/empty-reply nudges are streak-bounded (5/3 in a
+    row → recorded `ERROR`), so a session can never loop past its step budget.
 3. If DOCUMENT: the agent edits `agent/project/` (function/design docs + PROJECT.md nav).
    Commits that rename/move/delete files cited in docs trigger a path-hygiene pass
    even when they look like refactors.
